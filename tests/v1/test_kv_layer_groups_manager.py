@@ -512,6 +512,69 @@ class TestKernelAndObjectGroups:
         assert manager.object_groups[1].sw_size_chunks >= 1
         assert attn_desc.num_chunks_in_sw[1] == manager.object_groups[1].sw_size_chunks
 
+    def test_object_group_separation_standalone_group_buckets_alone(self):
+        # A standalone_object_group (connector-private pool) buckets alone
+        # even though its window (-1) matches the full-attention bucket.
+        # The rest bucket as usual, ordered by first kernel group index, so
+        # a client registering without the pool sees identical object group
+        # indices for the shared groups.
+        tensors = [torch.randn(2, 32, 32, 8, 64, dtype=torch.float16) for _ in range(3)]
+        manager = _build_manager(
+            tensors,
+            engine_group_infos=[
+                EngineGroupInfo(0, (0,)),
+                EngineGroupInfo(1, (1,), sw_size_tokens=32),
+                EngineGroupInfo(2, (2,), standalone_object_group=True),
+            ],
+            separate_object_groups=True,
+        )
+        assert manager.num_kernel_groups == 3
+        assert manager.num_object_groups == 3
+        assert manager.object_groups[0].kernel_group_indices == [0]
+        assert manager.object_groups[0].sw_size_chunks == -1
+        assert manager.object_groups[1].kernel_group_indices == [1]
+        assert manager.object_groups[1].sw_size_chunks >= 1
+        assert manager.object_groups[2].kernel_group_indices == [2]
+        assert manager.object_groups[2].sw_size_chunks == -1
+
+    def test_full_sw_kv_exempts_recurrent_groups(self):
+        # Blend-mode full-window forcing widens sliding-window ATTENTION
+        # groups to full attention, but recurrent-state groups keep their
+        # restore window: position-bound snapshots the blend never touches.
+        tensors = [torch.randn(2, 32, 32, 8, 64, dtype=torch.float16) for _ in range(3)]
+        manager = _build_manager(
+            tensors,
+            engine_group_infos=[
+                EngineGroupInfo(0, (0,)),
+                EngineGroupInfo(1, (1,), sw_size_tokens=64),
+                EngineGroupInfo(2, (2,), sw_size_tokens=32, recurrent_state=True),
+            ],
+            separate_object_groups=True,
+        )
+        manager.enable_full_sw_kv()
+        attn_desc = manager.get_attn_desc()
+        assert attn_desc.num_chunks_in_sw[0] == -1
+        # The sliding-window attention group is forced to full attention...
+        assert attn_desc.num_chunks_in_sw[1] == -1
+        # ...but the recurrent group keeps its one-block window.
+        assert attn_desc.num_chunks_in_sw[2] >= 1
+        assert attn_desc.group_kinds == ("attention", "attention", "recurrent")
+
+    def test_object_group_separation_disabled_ignores_standalone_flag(self):
+        # With separation off, the standalone flag has no effect: everything
+        # still collapses into the single fused object group.
+        tensors = [torch.randn(2, 32, 32, 8, 64, dtype=torch.float16) for _ in range(2)]
+        manager = _build_manager(
+            tensors,
+            engine_group_infos=[
+                EngineGroupInfo(0, (0,)),
+                EngineGroupInfo(1, (1,), standalone_object_group=True),
+            ],
+            separate_object_groups=False,
+        )
+        assert manager.num_object_groups == 1
+        assert manager.object_groups[0].kernel_group_indices == [0, 1]
+
     def test_object_group_separation_enabled_non_hybrid_single_group(self):
         # Even with separation on, a non-hybrid model (no sliding-window groups)
         # yields a single full-attention object group.

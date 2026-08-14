@@ -95,14 +95,58 @@ def _leaf_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
     return [spec]
 
 
+#: Reserved layer-name prefix for CacheBlend fused-aux page pools:
+#: ``cb.aux_pool.<tokens_per_block>`` (suffix = logical block size).
+CB_AUX_POOL_LAYER_PREFIX = "cb.aux_pool."
+
+
+def cb_aux_pool_entries(kv_caches) -> "list[tuple[str, int]]":
+    """CacheBlend fused-aux pool entries among the registered tensors.
+
+    Presence-gated: any layer name starting with
+    :data:`CB_AUX_POOL_LAYER_PREFIX` is a connector-owned aux page pool
+    forming its own synthetic engine group.
+
+    Args:
+        kv_caches: Registered tensors keyed by layer name.
+
+    Returns:
+        ``(layer_name, tokens_per_block)`` per aux pool, in registration
+        order; empty for models without one.
+
+    Raises:
+        ValueError: If a marker name's block-size suffix does not parse.
+    """
+    entries: list[tuple[str, int]] = []
+    for name in kv_caches:
+        if not name.startswith(CB_AUX_POOL_LAYER_PREFIX):
+            continue
+        suffix = name[len(CB_AUX_POOL_LAYER_PREFIX) :]
+        try:
+            tokens_per_block = int(suffix)
+        except ValueError as exc:
+            raise ValueError(
+                f"aux pool layer name {name!r}: block-size suffix "
+                f"{suffix!r} is not an integer"
+            ) from exc
+        if tokens_per_block <= 0:
+            raise ValueError(
+                f"aux pool layer name {name!r}: tokens_per_block must be "
+                f"positive, got {tokens_per_block}"
+            )
+        entries.append((name, tokens_per_block))
+    return entries
+
+
 def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
     """Reject KV cache group specs the transfer path cannot serve correctly.
 
     Rejected, with one aggregated error listing every offending group:
 
     - ``CrossAttentionSpec`` (encoder-decoder caches).
-    - Mamba groups with ``mamba_cache_mode != "align"``: other modes keep no
-      reusable per-block state snapshots.
+    - Mamba groups with ``mamba_cache_mode`` other than ``"align"`` or
+      ``"all"``: the remaining mode (``"none"``) keeps no reusable per-block
+      state snapshots.
 
     Specs declaring slot compression (``compress_ratio > 1`` /
     ``tq_slot_size > 0``, e.g. DeepSeek-V4) are NOT rejected: they are served
@@ -124,14 +168,13 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
             kind = get_kv_cache_spec_kind(spec)
             if kind == KVCacheSpecKind.CROSS_ATTENTION:
                 unsupported.append(f"group {group_idx}: CrossAttentionSpec")
-            elif (
-                kind == KVCacheSpecKind.MAMBA
-                and getattr(spec, "mamba_cache_mode", "none") != "align"
-            ):
+            elif kind == KVCacheSpecKind.MAMBA and getattr(
+                spec, "mamba_cache_mode", "none"
+            ) not in ("align", "all"):
                 unsupported.append(
                     f"group {group_idx}: MambaSpec with mamba_cache_mode="
                     f"'{getattr(spec, 'mamba_cache_mode', 'none')}' "
-                    f"(only 'align' keeps reusable state snapshots)"
+                    f"(only 'align' and 'all' keep reusable state snapshots)"
                 )
     if unsupported:
         raise ValueError(

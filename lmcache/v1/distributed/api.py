@@ -302,6 +302,13 @@ class AttnWindowDesc:
     world_size: int = 1
     """Number of kv_rank shards per chunk (tensor-parallel world size)."""
 
+    group_kinds: tuple[str, ...] = ()
+    """Optional per-group kind labels parallel to ``num_chunks_in_sw``:
+    ``"attention"`` / ``"recurrent"`` / ``"standalone"``. Empty when the
+    producer predates kinds (treat every group as attention)."""
+
+    _VALID_GROUP_KINDS = frozenset({"attention", "recurrent", "standalone"})
+
     def __post_init__(self) -> None:
         if self.world_size < 1:
             raise ValueError(
@@ -313,6 +320,16 @@ class AttnWindowDesc:
                     "AttnWindowDesc: each window must be -1 (full attention) "
                     f"or >= 1 chunk, got {w}"
                 )
+        if self.group_kinds:
+            if len(self.group_kinds) != len(self.num_chunks_in_sw):
+                raise ValueError(
+                    f"AttnWindowDesc: group_kinds has {len(self.group_kinds)} "
+                    f"entries but num_chunks_in_sw has "
+                    f"{len(self.num_chunks_in_sw)}"
+                )
+            bad = set(self.group_kinds) - self._VALID_GROUP_KINDS
+            if bad:
+                raise ValueError(f"AttnWindowDesc: unknown group kinds {bad!r}")
 
     @property
     def num_object_groups(self) -> int:

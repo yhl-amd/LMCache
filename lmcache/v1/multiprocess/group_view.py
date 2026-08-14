@@ -53,6 +53,16 @@ class EngineGroupInfo(msgspec.Struct, frozen=True):
     """Sliding window size in tokens for the layers of this group.
     ``-1`` means the layers are not sliding-window attention."""
 
+    standalone_object_group: bool = False
+    """Group must form its own object group under ``--separate-object-groups``
+    (connector-private pools, e.g. the CacheBlend fused-aux pool). Defaulted
+    field: wire-compatible with old payloads."""
+
+    recurrent_state: bool = False
+    """Pages hold recurrent state snapshots (Mamba/GDN) rather than attention
+    KV; the one-block window reflects restore semantics and blend full-window
+    forcing must not widen it. Defaulted field: wire-compatible."""
+
 
 def num_engine_groups(groups: Sequence[EngineGroupInfo]) -> int:
     """Return the number of engine groups (block-id lists per transfer request).

@@ -797,3 +797,50 @@ class TestOptimalLookupAlignedTiming:
                 f"V3={t_v3:8.1f}µs  ALIGNED={t_opt:8.1f}µs  "
                 f"speedup={t_v3 / t_opt:.1f}x"
             )
+
+
+class TestContentLevelRegistrationDedupe:
+    """The matcher must hold one generation per content, not one per store.
+
+    Token hashes chain over the preceding tokens, so a CacheBlend write-back
+    re-registers existing content under a fresh hash, displacing the warm
+    incumbent and turning lookups stale — see ``_content_is_live``.
+    """
+
+    def test_the_same_content_under_a_new_token_hash_is_refused(self):
+        matcher = BlendTokenRangeMatcherV3(chunk_size=CHUNK_SIZE)
+        stored = _chunk(1) + _chunk(2)
+        _register(matcher, stored, [101, 102])
+        _register(matcher, stored, [201, 202])  # a write-back of the same content
+
+        matches = matcher.match_sub_sequence(stored)
+        assert len(matches) == 2
+        assert [m.hash for m in matches] == [
+            ObjectKey.IntHash2Bytes(s) for s in (101, 102)
+        ]
+
+    def test_distinct_content_at_a_shifted_offset_still_registers(self):
+        """The check is on content, not position: a shifted window is new
+        content and must not be blocked by the chunk it overlaps."""
+        matcher = BlendTokenRangeMatcherV3(chunk_size=CHUNK_SIZE)
+        base = _chunk(1) + _chunk(2)
+        _register(matcher, base, [101, 102])
+        shifted = _chunk(9)[:1] + base  # every window boundary moves by one
+        _register(matcher, shifted, [301, 302])
+
+        hashes = {m.hash for m in matcher.match_sub_sequence(shifted)}
+        assert ObjectKey.IntHash2Bytes(301) in hashes
+
+    def test_content_is_registrable_again_once_the_incumbent_is_evicted(self):
+        """Self-healing: refusing the newcomer must not strand the content when
+        the object it was keeping alive goes away."""
+        matcher = BlendTokenRangeMatcherV3(chunk_size=CHUNK_SIZE)
+        stored = _chunk(1) + _chunk(2)
+        _register(matcher, stored, [101, 102])
+        matcher.remove_chunks([ObjectKey.IntHash2Bytes(s) for s in (101, 102)])
+        assert matcher.match_sub_sequence(stored) == []
+
+        _register(matcher, stored, [201, 202])
+        assert [m.hash for m in matcher.match_sub_sequence(stored)] == [
+            ObjectKey.IntHash2Bytes(s) for s in (201, 202)
+        ]
