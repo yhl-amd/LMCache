@@ -181,6 +181,9 @@ The coordinator's HTTP surface (base URL ``http://localhost:9300``) groups into:
   eviction.
 - **Cache control** -- the ``/cache`` group: cache operations dispatched to a
   named server (warm prefetch, pin/unpin, and delete, with more to come).
+- **Fleet memory** -- the ``/memory`` group: how full each server's memory
+  compartments are, joining event-derived usage against the capacity each
+  server declares when it registers. Read-only.
 - **CacheBlend fragment lookup** -- ``POST /directory/blend-lookup``: finds
   cached chunk content anywhere inside a query sequence, using the blend index
   derived from the key directory's token bindings. Server-to-coordinator only;
@@ -234,6 +237,14 @@ startup.
      - int
      - Optional (default ``0``). ZMQ message-queue port P2P peers send
        lookup/unlock RPCs to; ``0`` when P2P is disabled.
+   * - ``memory_modules``
+     - array
+     - Optional. The server's memory compartments, each
+       ``{tier, backend, capacity_bytes, shared}``. Sent automatically; it is
+       what makes ``GET /memory`` able to report a usage ratio. Omitting it
+       (or sending ``[]``) is valid -- usage is then reported without a
+       ratio. A re-registration **replaces** the previous set, so a server
+       that dropped an adapter must send its full current list.
 
 **Response** (``200 OK``):
 
@@ -1134,6 +1145,111 @@ sequence returns ``status`` ``"noop"``.
             "force": false
         }'
     # -> {"instance_id": "server-1", "requested": 12, "affected": 24, "skipped": 0, "status": "deleted"}
+
+Fleet memory
+------------
+
+The ``/memory`` group reports how full each MP server's memory compartments
+are. A **compartment** is one thing that owns bytes: the L1 pool of a backing
+medium, or one L2 adapter. It is identified by ``(tier, backend)`` -- the same
+pair cache events tag placements with.
+
+Two inputs are joined. **Usage** is derived from the cache-event stream the
+servers already publish. **Capacity** is what each server declares in
+``memory_modules`` when it registers, since a capacity changes at boot and at
+reconfiguration rather than per request. Both are automatic; there is nothing
+to configure beyond pointing servers at a coordinator.
+
+These endpoints are read-only. The coordinator never evicts or throttles based
+on them.
+
+.. note::
+
+   ``usage_ratio`` is ``null`` whenever the server declared no capacity for a
+   compartment, and this is common: the ``fs``, ``mooncake``, ``p2p``, and
+   ``sagemaker`` adapters expose no capacity setting at all, and ``s3`` /
+   ``raw_block`` report one only when you set ``max_capacity_gb`` /
+   ``capacity_bytes``. A ``null`` means *unknown*, never *empty* -- do not
+   treat it as ``0``.
+
+   Ratios above ``1.0`` are reported as-is rather than capped. A compartment
+   holding more than its declared capacity means the declaration is wrong, and
+   that is worth seeing.
+
+``GET /memory``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The whole fleet: every server's compartments, plus the shared pools.
+
+**Response** (``200 OK``):
+
+.. code-block:: json
+
+    {
+      "instances": [
+        {
+          "instance_id": "server-1",
+          "registered": true,
+          "declared_capacity": true,
+          "modules": [
+            {"tier": "l1", "backend": "dram", "shared": false,
+             "used_bytes": 10737418240, "capacity_bytes": 42949672960,
+             "usage_ratio": 0.25},
+            {"tier": "l2", "backend": "fs", "shared": false,
+             "used_bytes": 7516192768, "capacity_bytes": 0,
+             "usage_ratio": null}
+          ]
+        }
+      ],
+      "shared_modules": [
+        {"tier": "l2", "backend": "s3", "shared": true,
+         "used_bytes": 4398046511104, "capacity_bytes": 17592186044416,
+         "usage_ratio": 0.25}
+      ]
+    }
+
+``shared_modules`` holds storage several servers mount -- one S3 bucket, one
+CXL region. These are counted **once for the fleet** and appear in no
+instance's ``modules``. Summing them per mounting server would multiply both
+the bytes and the capacity by the number of mounts.
+
+A server appears when it is registered, when it still holds bytes, or when it
+declared capacity. ``registered: false`` therefore means a departed server
+whose L2 data outlived it; its L1 bytes are dropped when it goes.
+
+**Example:**
+
+.. code-block:: bash
+
+    # Which servers are most heavily loaded?
+    curl -s http://localhost:9300/memory | jq -r '
+      .instances[] | .instance_id as $i | .modules[]
+      | select(.usage_ratio != null)
+      | "\($i) \(.tier)/\(.backend) \((.usage_ratio*100|floor))%"'
+    # -> server-1 l1/dram 25%
+    # -> server-2 l1/dram 81%
+
+``GET /memory/{instance_id}``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+One server's compartments, in the same shape as an entry of ``instances``
+above.
+
+**HTTP status codes:**
+
+- ``200``: found.
+- ``404``: the coordinator knows nothing about this id -- it is not
+  registered, holds no bytes, and declared no capacity.
+
+**Example:**
+
+.. code-block:: bash
+
+    curl -s http://localhost:9300/memory/server-1
+
+A server whose L1 pool uses the default lazy allocator grows its heap on
+demand. Capacity here is the **configured** size, not the grown heap, so a
+freshly started server correctly reads near ``0``\% rather than near full.
 
 CacheBlend fragment lookup
 --------------------------
