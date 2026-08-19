@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from lmcache.logging import init_logger
 from lmcache.v1.mp_coordinator.http_apis.dependencies import get_context
 from lmcache.v1.mp_coordinator.registry import MPInstance
+from lmcache.v1.mp_coordinator.server_config import ModuleCapacity
 from lmcache.v1.mp_coordinator.schemas import (
     HeartbeatResponse,
     RegisterRequest,
@@ -45,11 +46,27 @@ async def register_instance(
         A :class:`RegisterResponse` carrying the (possibly generated) id.
     """
     instance_id = body.instance_id or f"mp-{uuid.uuid4().hex}"
+    ctx = get_context(request)
+    # Capacity before membership: a memory read that finds the instance
+    # registered but its modules undeclared would report a bare byte count
+    # with no ratio, which reads as "no capacity" rather than "not yet told".
+    ctx.server_config.declare(
+        instance_id,
+        [
+            ModuleCapacity(
+                tier=module.tier,
+                backend=module.backend,
+                capacity_bytes=module.capacity_bytes,
+                shared=module.shared,
+            )
+            for module in body.memory_modules
+        ],
+    )
     # Wall-clock registration_time for display; monotonic last_heartbeat_time for
     # NTP-safe stale detection (see registry.stale). register() does the
     # exists-check and write under one lock, so the re_registered flag is correct
     # even under concurrent registrations of the same id.
-    re_registered = get_context(request).registry.register(
+    re_registered = ctx.registry.register(
         MPInstance(
             instance_id=instance_id,
             ip=body.ip,
@@ -91,10 +108,16 @@ async def deregister_instance(instance_id: str, request: Request) -> Response:
     Returns:
         An empty 204 response.
     """
-    if get_context(request).registry.deregister(instance_id) is not None:
+    ctx = get_context(request)
+    if ctx.registry.deregister(instance_id) is not None:
         logger.info("Deregistered instance %s", instance_id)
     else:
         logger.info("Instance %s not registered, skipping deregistration", instance_id)
+    # Drop the capacity declaration with the membership. A departed server's
+    # caps describe a process that no longer exists, and keeping them would
+    # grow without bound across a churning fleet. Its surviving L2 bytes are
+    # still reported, just without a ratio.
+    ctx.server_config.forget(instance_id)
     return Response(status_code=204)
 
 

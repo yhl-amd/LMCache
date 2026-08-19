@@ -72,6 +72,53 @@ def decode_tokens(tokens_b64: str) -> np.ndarray:
     return np.frombuffer(raw, dtype="<u4").astype(np.uint64)
 
 
+# -- Server memory configuration ---------------------------------------------
+
+
+class ModuleCapacityModel(BaseModel):
+    """One memory compartment's declared capacity, as sent at registration.
+
+    A compartment is the L1 pool or one L2 adapter -- the same
+    ``(tier, backend)`` axis cache events report placements on, so a
+    declaration joins a usage total without translation.
+
+    Attributes:
+        tier: ``l1`` or ``l2``. ``all`` is rejected: a capacity has to name
+            the compartment it bounds.
+        backend: Storage backend within the tier (``"dram"``, ``"s3"``,
+            ...). Non-empty.
+        capacity_bytes: Declared capacity. ``0`` means the server has no
+            configured limit for this compartment, which is the default
+            for several L2 adapters and is reported as unknown rather than
+            as full.
+        shared: ``True`` when several instances mount this same pool, so
+            its capacity is fleet-scoped and must not be summed.
+    """
+
+    tier: Tier
+    backend: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    capacity_bytes: int = Field(default=0, ge=0)
+    shared: bool = False
+
+    @field_validator("tier")
+    @classmethod
+    def _reject_tier_all(cls, value: Tier) -> Tier:
+        """Reject ``Tier.ALL``, which names no single compartment.
+
+        Args:
+            value: The submitted tier.
+
+        Returns:
+            The validated tier.
+
+        Raises:
+            ValueError: If ``value`` is ``Tier.ALL``.
+        """
+        if value not in (Tier.L1, Tier.L2):
+            raise ValueError("tier must be 'l1' or 'l2'")
+        return value
+
+
 class RegisterRequest(BaseModel):
     """Body of a ``POST /instances`` registration request.
 
@@ -89,6 +136,12 @@ class RegisterRequest(BaseModel):
         mq_port: Port of the instance's ZMQ message-queue server that P2P peers
             send lookup/unlock RPCs to, reachable at the instance's ``ip``.
             Optional -- 0 when P2P is disabled.
+        memory_modules: The server's per-compartment memory capacities (L1
+            pool, one entry per L2 adapter). Optional -- an empty list means
+            the server declared nothing, and its usage is then reported
+            without a pressure ratio. A re-registration replaces the
+            previous declaration wholesale, so a server that dropped an
+            adapter must send its full current set.
     """
 
     instance_id: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
@@ -97,6 +150,7 @@ class RegisterRequest(BaseModel):
     metadata: dict[str, str] = Field(default_factory=dict)
     p2p_advertised_url: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
     mq_port: int = Field(default=0, ge=0, le=65535)
+    memory_modules: list[ModuleCapacityModel] = Field(default_factory=list)
 
 
 class RegisterResponse(BaseModel):
@@ -213,6 +267,74 @@ class StatusListResponse(BaseModel):
 
     total_gb: float
     by_cache_salt: list[StatusResponse]
+
+
+# -- Memory pressure ---------------------------------------------------------
+
+
+class ModuleMemoryStatus(BaseModel):
+    """Usage joined to declared capacity for one memory compartment.
+
+    Attributes:
+        tier: ``l1`` or ``l2``.
+        backend: Storage backend within the tier.
+        shared: ``True`` when this is a fleet-shared pool. Its bytes are
+            counted once for the fleet, not once per mounting instance.
+        used_bytes: Bytes the compartment currently holds, derived from the
+            admitted cache-event stream.
+        capacity_bytes: The server's declared capacity, or ``0`` when it
+            declared none.
+        usage_ratio: ``used_bytes / capacity_bytes``, or ``None`` when no
+            capacity was declared. ``None`` rather than a sentinel: there
+            is no ratio to report, and a number would be read as one.
+            Values above ``1.0`` are possible and are not clamped -- the
+            declared cap can be smaller than what the tier actually
+            admitted, and hiding that would hide a misconfiguration.
+    """
+
+    tier: Tier
+    backend: str
+    shared: bool
+    used_bytes: int
+    capacity_bytes: int
+    usage_ratio: float | None = None
+
+
+class InstanceMemoryStatus(BaseModel):
+    """One MP server's memory compartments.
+
+    Attributes:
+        instance_id: The server this describes.
+        registered: ``True`` when the server is currently in the instance
+            registry. A server can hold L2 bytes while deregistered, so a
+            status can legitimately appear with this ``False``.
+        declared_capacity: ``True`` when the server declared any module
+            capacity at registration. When ``False`` every module's
+            ``usage_ratio`` is ``None``.
+        modules: Its privately-owned compartments, sorted by tier then
+            backend. Shared pools are reported once at the fleet level
+            instead.
+    """
+
+    instance_id: str
+    registered: bool
+    declared_capacity: bool
+    modules: list[ModuleMemoryStatus] = Field(default_factory=list)
+
+
+class FleetMemoryResponse(BaseModel):
+    """Fleet-wide memory view: every server plus the shared pools.
+
+    Attributes:
+        instances: Per-server status, sorted by ``instance_id``.
+        shared_modules: Fleet-shared compartments, counted once. Their
+            capacity is reported only when every declaring server agrees
+            on it; a disagreement is reported as undeclared, since there
+            is no basis for picking one.
+    """
+
+    instances: list[InstanceMemoryStatus] = Field(default_factory=list)
+    shared_modules: list[ModuleMemoryStatus] = Field(default_factory=list)
 
 
 # -- Key directory -----------------------------------------------------------
