@@ -296,3 +296,66 @@ def test_delete_releases_bytes_over_real_http(coordinator) -> None:
 
 def test_unknown_instance_is_404_over_real_http(coordinator) -> None:
     assert requests.get(f"{coordinator}/memory/nobody", timeout=2).status_code == 404
+
+
+def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> None:
+    """The two halves of the feature meet: what an MP server actually
+    produces is what the coordinator can actually join against.
+
+    Uses the real conversion the registrar performs on the output shape of
+    ``StorageManager.get_memory_capacities()``, so a drift between the
+    producer's compartment identity and the event stream's ``(tier,
+    backend)`` would surface here as a missing ratio rather than in
+    production.
+    """
+    # First Party
+    from lmcache.v1.distributed.api import ModuleMemoryCapacity
+    from lmcache.v1.mp_coordinator.schemas import ModuleCapacityModel, RegisterRequest
+
+    # Exactly what get_memory_capacities() returns for a hybrid Device-DAX
+    # server with a private fs adapter and a shared, uncapped bucket.
+    produced = [
+        ModuleMemoryCapacity(Tier.L1, "devdax", 100 * GIB, False),
+        ModuleMemoryCapacity(Tier.L1, "dram", 10 * GIB, False),
+        ModuleMemoryCapacity(Tier.L2, "fs", 200 * GIB, False),
+        ModuleMemoryCapacity(Tier.L2, "s3", 0, True),
+    ]
+    body = RegisterRequest(
+        instance_id="mp-1",
+        ip="127.0.0.1",
+        http_port=9999,
+        memory_modules=[
+            ModuleCapacityModel(
+                tier=c.tier,
+                backend=c.backend,
+                capacity_bytes=c.capacity_bytes,
+                shared=c.shared,
+            )
+            for c in produced
+        ],
+    )
+    response = requests.post(
+        f"{coordinator}/instances", json=body.model_dump(mode="json"), timeout=2
+    )
+    assert response.status_code == 200, response.text
+
+    # Usage arrives on the event stream, tagged the way L1/L2 events tag it.
+    _publish(coordinator, "mp-1", Tier.L1, "devdax", 25 * GIB, index=1, seq=1)
+    _publish(coordinator, "mp-1", Tier.L1, "dram", 5 * GIB, index=2, seq=2)
+    _publish(coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=3, seq=3)
+    _publish(coordinator, "mp-1", Tier.L2, "s3", 9 * GIB, index=4, seq=4, shared=True)
+
+    status = requests.get(f"{coordinator}/memory/mp-1", timeout=2).json()
+    assert status["declared_capacity"] is True
+
+    # Every declared compartment joins -- the producer's backend strings and
+    # the event stream's agree, including the hybrid tier's two mediums.
+    assert _module(status, "l1", "devdax")["usage_ratio"] == pytest.approx(0.25)
+    assert _module(status, "l1", "dram")["usage_ratio"] == pytest.approx(0.5)
+    assert _module(status, "l2", "fs")["usage_ratio"] == pytest.approx(0.25)
+
+    # The uncapped shared bucket is fleet-scoped and still has no denominator.
+    pool = requests.get(f"{coordinator}/memory", timeout=2).json()["shared_modules"]
+    assert [(p["backend"], p["used_bytes"], p["usage_ratio"]) for p in pool] == [
+        ("s3", 9 * GIB, None)
+    ]
