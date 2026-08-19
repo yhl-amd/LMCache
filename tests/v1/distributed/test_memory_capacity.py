@@ -8,14 +8,18 @@ spanning several mediums reports one compartment per medium.
 """
 
 # Standard
+from typing import cast
 import threading
 
 # Third Party
 import pytest
 
 # First Party
-from lmcache.v1.distributed.api import L1BackendType, Tier
+from lmcache.v1.distributed.api import L1BackendType, ModuleMemoryCapacity, Tier
+from lmcache.v1.distributed.l1_manager import L1Manager
+from lmcache.v1.distributed.memory_manager.l1_manager_protocol import L1ManagerProtocol
 from lmcache.v1.distributed.memory_manager.l1_memory_manager import L1MemoryManager
+from lmcache.v1.distributed.storage_manager import StorageManager
 
 GIB = 1 << 30
 
@@ -65,24 +69,48 @@ class _FakeL1Manager:
         return self._capacities
 
 
-def _capacities(l1: dict, adapters: list) -> list:
+class _StorageManagerStub:
+    """The two members ``get_memory_capacities`` reaches for.
+
+    Stands in for a real ``StorageManager`` so the method can be exercised
+    without ``__init__``, which allocates pinned memory and spawns threads.
+    """
+
+    def __init__(
+        self,
+        l1: dict[L1BackendType, int],
+        adapters: list[tuple[_FakeDescriptor, _FakeAdapter]],
+    ) -> None:
+        self._l1_manager = _FakeL1Manager(l1)
+        self._adapters = adapters
+
+    def _snapshot_adapters(
+        self,
+    ) -> list[tuple[int, _FakeDescriptor, _FakeAdapter]]:
+        return [
+            (index, desc, adapter)
+            for index, (desc, adapter) in enumerate(self._adapters)
+        ]
+
+
+def _capacities(
+    l1: dict[L1BackendType, int],
+    adapters: list[tuple[_FakeDescriptor, _FakeAdapter]],
+) -> list[ModuleMemoryCapacity]:
     """Run ``StorageManager.get_memory_capacities`` against fakes.
 
-    Bound as an unbound function so the real ``StorageManager.__init__`` --
-    which allocates pinned memory and spawns threads -- is not needed.
+    Called unbound on a structural stand-in; the cast records that the stub
+    satisfies only the part of ``StorageManager`` this method touches.
+
+    Args:
+        l1: Configured L1 capacity per backing medium.
+        adapters: The L2 adapters to report, as ``(descriptor, adapter)``.
+
+    Returns:
+        The capacities the method assembles.
     """
-    # First Party
-    from lmcache.v1.distributed.storage_manager import StorageManager
-
-    class _Stub:
-        pass
-
-    stub = _Stub()
-    stub._l1_manager = _FakeL1Manager(l1)
-    stub._snapshot_adapters = lambda: [
-        (index, desc, adapter) for index, (desc, adapter) in enumerate(adapters)
-    ]
-    return StorageManager.get_memory_capacities(stub)
+    stub = _StorageManagerStub(l1, adapters)
+    return StorageManager.get_memory_capacities(cast("StorageManager", stub))
 
 
 class TestL1ConfiguredCapacity:
@@ -171,9 +199,17 @@ class TestReportStatusSharesTheSource:
     and the fleet view will disagree about the same server.
     """
 
-    def _l1_manager(self, configured: dict[L1BackendType, int]) -> object:
-        # First Party
-        from lmcache.v1.distributed.l1_manager import L1Manager
+    def _l1_manager(self, configured: dict[L1BackendType, int]) -> L1Manager:
+        """Build an L1Manager over a fake memory manager.
+
+        Args:
+            configured: Capacity the fake reports per backing medium.
+
+        Returns:
+            A manager whose ``report_status`` is callable. ``__init__`` is
+            skipped because it allocates pinned memory; the cast records
+            that the fake covers only the members ``report_status`` reads.
+        """
 
         class _MemoryManager:
             def get_memory_usage(self) -> tuple[int, int]:
@@ -188,10 +224,10 @@ class TestReportStatusSharesTheSource:
                 return True
 
         manager = L1Manager.__new__(L1Manager)
-        manager._memory_manager = _MemoryManager()
+        manager._memory_manager = cast("L1ManagerProtocol", _MemoryManager())
         manager._objects = {}
-        manager._write_ttl_seconds = 600.0
-        manager._read_ttl_seconds = 600.0
+        manager._write_ttl_seconds = 600
+        manager._read_ttl_seconds = 600
         # report_status is lock-guarded; the real __init__ is skipped here
         # because it allocates pinned memory.
         manager._lock = threading.Lock()

@@ -20,12 +20,12 @@ from fastapi.responses import JSONResponse
 from lmcache.logging import init_logger
 from lmcache.v1.mp_coordinator.http_apis.dependencies import get_context
 from lmcache.v1.mp_coordinator.registry import MPInstance
-from lmcache.v1.mp_coordinator.server_config import ModuleCapacity
 from lmcache.v1.mp_coordinator.schemas import (
     HeartbeatResponse,
     RegisterRequest,
     RegisterResponse,
 )
+from lmcache.v1.mp_coordinator.server_config import ModuleCapacity
 
 logger = init_logger(__name__)
 

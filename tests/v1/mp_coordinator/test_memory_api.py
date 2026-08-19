@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the coordinator's fleet memory-pressure endpoints."""
 
+# Standard
+from typing import cast
+
 # Third Party
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
@@ -14,6 +18,7 @@ from lmcache.v1.mp_coordinator.api import (
 )
 from lmcache.v1.mp_coordinator.app import create_app
 from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
+from lmcache.v1.mp_coordinator.http_apis.dependencies import CoordinatorContext
 
 GIB = 1 << 30
 
@@ -25,6 +30,21 @@ def client() -> TestClient:
         MPCoordinatorConfig(health_check_interval=0, eviction_check_interval=0)
     )
     return TestClient(app)
+
+
+def _ctx(client: TestClient) -> CoordinatorContext:
+    """Return the coordinator context behind ``client``.
+
+    ``TestClient.app`` is typed as a bare ASGI callable, so the concrete
+    app type is restored once here rather than at each call site.
+
+    Args:
+        client: The test client wrapping a coordinator app.
+
+    Returns:
+        That app's :class:`CoordinatorContext`.
+    """
+    return cast("FastAPI", client.app).state.ctx
 
 
 def _register(
@@ -62,7 +82,7 @@ def _ingest(
         kv_rank=0,
         cache_salt="tenant",
     )
-    client.app.state.ctx.event_gate.ingest(
+    _ctx(client).event_gate.ingest(
         CacheEventBatch(
             instance_id=instance_id,
             incarnation=1,
