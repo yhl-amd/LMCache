@@ -11,7 +11,7 @@ import threading
 # First Party
 from lmcache.lmcache_native import TTLLock
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener, L1ObjectMeta
@@ -839,6 +839,20 @@ class L1Manager:
         """
         return self._memory_manager.get_memory_usage()
 
+    def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
+        """Return the configured capacity of each L1 backing medium.
+
+        Unlike :meth:`get_memory_usage`'s total, which some allocators
+        report as the currently grown heap, this is the operator-declared
+        size and is therefore stable from boot -- the correct denominator
+        for an occupancy figure.
+
+        Returns:
+            Configured bytes per medium; a hybrid tier reports one entry
+            per medium, and mediums sized zero are omitted.
+        """
+        return self._memory_manager.get_configured_capacity_bytes()
+
     def get_l1_memory_desc(self):
         """Return an L1MemoryDesc describing the underlying L1 memory buffer."""
         return self._memory_manager.get_l1_memory_desc()
@@ -867,6 +881,15 @@ class L1Manager:
             if entry.is_temporary:
                 temporary += 1
         used, total = self._memory_manager.get_memory_usage()
+        # ``memory_total_bytes`` is whatever the allocator currently backs,
+        # which on the default lazy tier is the grown heap rather than the
+        # operator's cap -- so it climbs as the pool warms up.
+        # ``memory_configured_bytes`` is the declared size, stable from boot.
+        # Reported as one number to match this dict's flat shape; the
+        # per-medium split (a hybrid Device-DAX tier spans two) is available
+        # from ``get_configured_capacity_bytes()``. ``0`` means nothing was
+        # configured.
+        configured = sum(self._memory_manager.get_configured_capacity_bytes().values())
         return {
             "is_healthy": self._memory_manager.memcheck(),
             "total_object_count": len(self._objects),
@@ -875,6 +898,7 @@ class L1Manager:
             "temporary_count": temporary,
             "memory_used_bytes": used,
             "memory_total_bytes": total,
+            "memory_configured_bytes": configured,
             "memory_usage_ratio": used / total if total > 0 else 0.0,
             "write_ttl_seconds": self._write_ttl_seconds,
             "read_ttl_seconds": self._read_ttl_seconds,

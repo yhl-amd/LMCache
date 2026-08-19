@@ -13,6 +13,7 @@ logged and retried, and it never takes the MP server down.
 """
 
 # Standard
+from collections.abc import Sequence
 import asyncio
 import contextlib
 
@@ -22,7 +23,12 @@ import httpx
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.mp_coordinator.schemas import RegisterRequest, RegisterResponse
+from lmcache.v1.distributed.api import ModuleMemoryCapacity
+from lmcache.v1.mp_coordinator.schemas import (
+    ModuleCapacityModel,
+    RegisterRequest,
+    RegisterResponse,
+)
 from lmcache.v1.rpc_utils import get_ip
 
 logger = init_logger(__name__)
@@ -39,6 +45,7 @@ async def register(
     instance_id: str = "",
     p2p_advertised_url: str = "",
     mq_port: int = 0,
+    memory_capacities: Sequence[ModuleMemoryCapacity] = (),
 ) -> str:
     """Register an MP server with the coordinator and return its id.
 
@@ -52,6 +59,11 @@ async def register(
             when P2P is disabled.
         mq_port: Port of this server's ZMQ message-queue server for P2P lookup
             RPCs. 0 when P2P is disabled.
+        memory_capacities: This server's per-compartment memory capacities.
+            Empty declares nothing, and the coordinator then reports this
+            server's usage without a pressure ratio. Sent on every
+            registration, so a re-registration after reconfiguration
+            republishes the current topology.
 
     Returns:
         The registered instance id (coordinator-assigned if ``instance_id`` was
@@ -66,8 +78,19 @@ async def register(
         http_port=http_port,
         p2p_advertised_url=p2p_advertised_url,
         mq_port=mq_port,
+        memory_modules=[
+            ModuleCapacityModel(
+                tier=capacity.tier,
+                backend=capacity.backend,
+                capacity_bytes=capacity.capacity_bytes,
+                shared=capacity.shared,
+            )
+            for capacity in memory_capacities
+        ],
     )
-    response = await client.post(f"{base_url}/instances", json=body.model_dump())
+    response = await client.post(
+        f"{base_url}/instances", json=body.model_dump(mode="json")
+    )
     response.raise_for_status()
     return RegisterResponse.model_validate(response.json()).instance_id
 
@@ -82,6 +105,7 @@ async def keep_registered(
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     p2p_advertised_url: str = "",
     mq_port: int = 0,
+    memory_capacities: Sequence[ModuleMemoryCapacity] = (),
 ) -> None:
     """Register, heartbeat on a timer, and deregister on cancellation.
 
@@ -105,6 +129,8 @@ async def keep_registered(
             when P2P is disabled.
         mq_port: Port of this server's ZMQ message-queue server for P2P lookup
             RPCs. 0 when P2P is disabled.
+        memory_capacities: This server's per-compartment memory capacities,
+            resent on every re-registration. Empty declares nothing.
     """
     base_url = coordinator_url.rstrip("/")
     ip = advertise_ip or get_ip()
@@ -121,6 +147,7 @@ async def keep_registered(
                         instance_id=instance_id,
                         p2p_advertised_url=p2p_advertised_url,
                         mq_port=mq_port,
+                        memory_capacities=memory_capacities,
                     )
                     logger.info("Registered with coordinator as %s", assigned_id)
                 else:

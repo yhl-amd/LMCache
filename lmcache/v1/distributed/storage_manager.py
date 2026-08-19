@@ -15,10 +15,12 @@ from lmcache.lmcache_native import Bitmap, PeriodicEventNotifier
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
+    ModuleMemoryCapacity,
     ObjectKey,
     PrefetchHandle,
     PrefetchMode,
     PrefetchRequestSpec,
+    Tier,
     TrimPolicy,
 )
 from lmcache.v1.distributed.bitmap_ops import fold_unfold_ranked
@@ -831,6 +833,56 @@ class StorageManager:
                 continue
             out_by_type.setdefault(desc.type_name, []).append(usage)
         return out_by_type
+
+    def get_memory_capacities(self) -> list[ModuleMemoryCapacity]:
+        """Report every memory compartment's configured capacity.
+
+        The declaration an MP server sends the coordinator at
+        registration, joined there against event-derived usage to yield a
+        pressure reading. Capacity is configuration, so this is read once
+        per registration rather than polled.
+
+        L1 is reported per backing medium (a hybrid Device-DAX tier spans
+        two). L2 is reported per adapter, keeping each adapter's own
+        ``shared`` flag: a pool several instances mount is fleet-scoped
+        and must be counted once, not once per mount. An adapter whose
+        ``get_usage()`` raises is skipped rather than reported with a
+        wrong capacity.
+
+        Returns:
+            One entry per compartment. Adapters that declare no limit
+            appear with ``capacity_bytes == 0``, meaning unknown.
+        """
+        capacities = [
+            ModuleMemoryCapacity(
+                tier=Tier.L1,
+                backend=backend.value,
+                capacity_bytes=configured,
+                shared=False,
+            )
+            for backend, configured in (
+                self._l1_manager.get_configured_capacity_bytes().items()
+            )
+        ]
+        for _adapter_id, desc, adapter in self._snapshot_adapters():
+            try:
+                usage = adapter.get_usage()
+            except Exception:
+                logger.exception(
+                    "L2 adapter %s get_usage() failed; omitting from the "
+                    "capacity report",
+                    desc.type_name,
+                )
+                continue
+            capacities.append(
+                ModuleMemoryCapacity(
+                    tier=Tier.L2,
+                    backend=desc.type_name,
+                    capacity_bytes=int(usage.total_capacity_bytes),
+                    shared=bool(desc.config.shared),
+                )
+            )
+        return capacities
 
     def get_l1_usage(self) -> tuple[int, int]:
         """Current occupancy of the L1 memory pool.

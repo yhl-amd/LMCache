@@ -145,6 +145,21 @@ class L1MemoryManager:
         self._allocator.batched_free(mem_objs)
         return L1Error.SUCCESS
 
+    def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
+        """Return the configured capacity of this tier.
+
+        The CPU tier is pinned DRAM only, so this is a single entry. The
+        value is the configured ``size_in_bytes``, not the lazily grown
+        heap that ``get_memory_usage()`` reports as its total.
+
+        Returns:
+            ``{L1BackendType.DRAM: configured_bytes}``, or an empty dict
+            when no capacity is configured.
+        """
+        if self._size_in_bytes <= 0:
+            return {}
+        return {L1BackendType.DRAM: self._size_in_bytes}
+
     def get_backend_type(self, memory_obj: MemoryObj) -> L1BackendType:
         """Return the storage medium backing ``memory_obj``.
 

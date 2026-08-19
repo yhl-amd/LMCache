@@ -50,6 +50,7 @@ class GDSL1MemoryManager:
                 ``memory_config`` is not referenced on the GDS path.
         """
         self._address_manager = AddressManager(config.size_in_bytes, config.align_bytes)
+        self._size_in_bytes = config.size_in_bytes
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
@@ -115,6 +116,17 @@ class GDSL1MemoryManager:
             ``L1BackendType.GDS`` — this tier's only medium is the slab file.
         """
         return L1BackendType.GDS
+
+    def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
+        """Return the configured capacity of the GDS slab.
+
+        Returns:
+            ``{L1BackendType.GDS: configured_bytes}``, or an empty dict
+            when no capacity is configured.
+        """
+        if self._size_in_bytes <= 0:
+            return {}
+        return {L1BackendType.GDS: self._size_in_bytes}
 
     def get_memory_usage(self) -> tuple[int, int]:
         """Return ``(used_bytes, total_bytes)`` of the slab."""
