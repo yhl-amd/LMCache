@@ -34,26 +34,6 @@ class L1ManagerProtocol(Protocol):
         """Return ``(used_bytes, total_bytes)``."""
         ...
 
-    def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
-        """Return the configured capacity of each backing medium.
-
-        Distinct from ``get_memory_usage()[1]``, which some allocators
-        report as the *currently grown* heap rather than the configured
-        cap -- a freshly booted lazy tier would otherwise look full. This
-        is the operator-declared size, so it is stable from boot and is
-        the correct denominator for an occupancy figure.
-
-        Keyed per medium because one L1 tier can span several: a hybrid
-        Device-DAX tier backs objects with both ``devdax`` and ``dram``,
-        and cache events tag L1 placements the same way, so capacity and
-        usage line up on the same compartments.
-
-        Returns:
-            Configured bytes per medium; mediums with no capacity are
-            omitted rather than reported as zero.
-        """
-        ...
-
     def get_backend_type(self, memory_obj: MemoryObj) -> L1BackendType:
         """Return the storage medium backing ``memory_obj``."""
         ...

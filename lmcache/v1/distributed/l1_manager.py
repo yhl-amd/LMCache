@@ -12,7 +12,7 @@ import threading
 from lmcache.lmcache_native import TTLLock
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.config import L1ManagerConfig
+from lmcache.v1.distributed.config import L1ManagerConfig, configured_l1_capacity_bytes
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener, L1ObjectMeta
 from lmcache.v1.distributed.memory_manager import (
@@ -203,6 +203,9 @@ class L1Manager:
         else:
             self._memory_manager = L1MemoryManager(config.memory_config)
 
+        # Retained so configured capacity stays derivable from the one
+        # source of truth rather than re-read from live allocator state.
+        self._config = config
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
 
@@ -851,7 +854,7 @@ class L1Manager:
             Configured bytes per medium; a hybrid tier reports one entry
             per medium, and mediums sized zero are omitted.
         """
-        return self._memory_manager.get_configured_capacity_bytes()
+        return configured_l1_capacity_bytes(self._config)
 
     def get_l1_memory_desc(self):
         """Return an L1MemoryDesc describing the underlying L1 memory buffer."""
@@ -889,7 +892,7 @@ class L1Manager:
         # per-medium split (a hybrid Device-DAX tier spans two) is available
         # from ``get_configured_capacity_bytes()``. ``0`` means nothing was
         # configured.
-        configured = sum(self._memory_manager.get_configured_capacity_bytes().values())
+        configured = sum(configured_l1_capacity_bytes(self._config).values())
         return {
             "is_healthy": self._memory_manager.memcheck(),
             "total_object_count": len(self._objects),

@@ -138,11 +138,11 @@ async def lifespan(app: FastAPI):
                 heartbeat_interval=coordinator_config.heartbeat_interval,
                 p2p_advertised_url=mp_config.p2p_config.advertise_url,
                 mq_port=mp_config.port if mp_config.p2p_config.enabled else 0,
-                # Declared once per registration: capacity is configuration,
-                # not something the event stream can carry. Read here rather
-                # than inside keep_registered so the registrar keeps no
+                # Passed as a probe, not a snapshot: adapters can be added
+                # or removed at runtime, so a re-registration must publish the
+                # topology as it is then. Bound here so the registrar keeps no
                 # dependency on the engine.
-                memory_capacities=engine.storage_manager.get_memory_capacities(),
+                memory_capacities=engine.storage_manager.get_memory_capacities,
             )
         )
     # Optionally report cache events to the coordinator

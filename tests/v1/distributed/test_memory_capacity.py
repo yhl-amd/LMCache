@@ -16,9 +16,14 @@ import pytest
 
 # First Party
 from lmcache.v1.distributed.api import L1BackendType, ModuleMemoryCapacity, Tier
+from lmcache.v1.distributed.config import (
+    GdsL1Config,
+    L1ManagerConfig,
+    L1MemoryManagerConfig,
+    configured_l1_capacity_bytes,
+)
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.memory_manager.l1_manager_protocol import L1ManagerProtocol
-from lmcache.v1.distributed.memory_manager.l1_memory_manager import L1MemoryManager
 from lmcache.v1.distributed.storage_manager import StorageManager
 
 GIB = 1 << 30
@@ -113,18 +118,136 @@ def _capacities(
     return StorageManager.get_memory_capacities(cast("StorageManager", stub))
 
 
-class TestL1ConfiguredCapacity:
+def _config_yielding(capacities: dict[L1BackendType, int]) -> L1ManagerConfig:
+    """Build a config whose derived capacity equals ``capacities``.
+
+    Args:
+        capacities: The per-medium result the config should produce.
+
+    Returns:
+        A matching :class:`L1ManagerConfig`.
+
+    Raises:
+        ValueError: If the combination is not expressible as one tier.
+    """
+    if set(capacities) == {L1BackendType.GDS}:
+        return L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(size_in_bytes=0, use_lazy=True),
+            gds_l1_config=GdsL1Config(
+                size_in_bytes=capacities[L1BackendType.GDS],
+                file_location="/tmp/gds-slab",
+            ),
+        )
+    if L1BackendType.DEVDAX in capacities:
+        return L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(
+                size_in_bytes=capacities.get(L1BackendType.DRAM, 0),
+                devdax_path="/dev/dax0.0",
+                devdax_size_in_bytes=capacities[L1BackendType.DEVDAX],
+                use_lazy=False,
+                shm_name="",
+            )
+        )
+    if set(capacities) <= {L1BackendType.DRAM}:
+        return L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(
+                size_in_bytes=capacities.get(L1BackendType.DRAM, 0), use_lazy=True
+            )
+        )
+    raise ValueError(f"not expressible as one tier: {capacities}")
+
+
+class TestConfiguredL1Capacity:
+    """The single derivation of "how large is L1", from config alone."""
+
+    def _config(self, **memory: object) -> L1ManagerConfig:
+        """Build an L1ManagerConfig with the given memory-config fields."""
+        defaults: dict[str, object] = {
+            "size_in_bytes": 0,
+            "devdax_path": None,
+            "use_lazy": True,
+        }
+        defaults.update(memory)
+        return L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(**defaults)  # type: ignore[arg-type]
+        )
+
     def test_cpu_tier_reports_configured_size_not_grown_heap(self) -> None:
         # The lazy allocator starts small and grows; reporting its current
         # heap as the denominator would make a fresh server read ~100% full.
-        manager = L1MemoryManager.__new__(L1MemoryManager)
-        manager._size_in_bytes = 40 * GIB
-        assert manager.get_configured_capacity_bytes() == {L1BackendType.DRAM: 40 * GIB}
+        config = self._config(size_in_bytes=40 * GIB)
+        assert configured_l1_capacity_bytes(config) == {L1BackendType.DRAM: 40 * GIB}
 
     def test_unconfigured_tier_reports_nothing_rather_than_zero(self) -> None:
-        manager = L1MemoryManager.__new__(L1MemoryManager)
-        manager._size_in_bytes = 0
-        assert manager.get_configured_capacity_bytes() == {}
+        assert configured_l1_capacity_bytes(self._config()) == {}
+
+    def test_pure_devdax_reports_one_medium(self) -> None:
+        # An unset devdax size means the whole tier is Device-DAX.
+        config = self._config(
+            size_in_bytes=100 * GIB,
+            devdax_path="/dev/dax0.0",
+            use_lazy=False,
+            shm_name="",
+        )
+        assert configured_l1_capacity_bytes(config) == {L1BackendType.DEVDAX: 100 * GIB}
+
+    def test_hybrid_devdax_splits_into_two_mediums(self) -> None:
+        # L1 events tag placements per medium, so capacity must too.
+        config = self._config(
+            size_in_bytes=10 * GIB,
+            devdax_path="/dev/dax0.0",
+            devdax_size_in_bytes=100 * GIB,
+            use_lazy=False,
+            shm_name="",
+        )
+        assert configured_l1_capacity_bytes(config) == {
+            L1BackendType.DEVDAX: 100 * GIB,
+            L1BackendType.DRAM: 10 * GIB,
+        }
+
+    def test_gds_tier_wins_over_the_dram_config(self) -> None:
+        config = L1ManagerConfig(
+            memory_config=L1MemoryManagerConfig(size_in_bytes=40 * GIB, use_lazy=True),
+            gds_l1_config=GdsL1Config(
+                size_in_bytes=8 * GIB, file_location="/tmp/gds-slab"
+            ),
+        )
+        assert configured_l1_capacity_bytes(config) == {L1BackendType.GDS: 8 * GIB}
+
+    def test_matches_the_devdax_manager_arena_split(self) -> None:
+        # The helper mirrors DevDaxL1MemoryManager.__init__; if that split
+        # ever changes, this is where the drift shows up.
+        memory_config = L1MemoryManagerConfig(
+            size_in_bytes=10 * GIB,
+            devdax_path="/dev/dax0.0",
+            devdax_size_in_bytes=100 * GIB,
+            use_lazy=False,
+            shm_name="",
+        )
+        devdax_size = memory_config.devdax_size_in_bytes or memory_config.size_in_bytes
+        local_size = (
+            memory_config.size_in_bytes if memory_config.devdax_size_in_bytes else 0
+        )
+        derived = configured_l1_capacity_bytes(
+            L1ManagerConfig(memory_config=memory_config)
+        )
+        assert derived[L1BackendType.DEVDAX] == devdax_size
+        assert derived[L1BackendType.DRAM] == local_size
+
+    def test_total_matches_what_usage_telemetry_reports(self) -> None:
+        # usage_telemetry sums the same derivation; a divergence would make
+        # the CLI, telemetry, and the fleet view disagree about one server.
+        memory_config = L1MemoryManagerConfig(
+            size_in_bytes=10 * GIB,
+            devdax_path="/dev/dax0.0",
+            devdax_size_in_bytes=100 * GIB,
+            use_lazy=False,
+            shm_name="",
+        )
+        config = L1ManagerConfig(memory_config=memory_config)
+        assert sum(configured_l1_capacity_bytes(config).values()) == (
+            memory_config.size_in_bytes + memory_config.devdax_size_in_bytes
+        )
 
 
 class TestStorageManagerCapacities:
@@ -225,6 +348,9 @@ class TestReportStatusSharesTheSource:
 
         manager = L1Manager.__new__(L1Manager)
         manager._memory_manager = cast("L1ManagerProtocol", _MemoryManager())
+        # Capacity is now derived from config, so the manager needs one that
+        # yields exactly `configured`.
+        manager._config = _config_yielding(configured)
         manager._objects = {}
         manager._write_ttl_seconds = 600
         manager._read_ttl_seconds = 600

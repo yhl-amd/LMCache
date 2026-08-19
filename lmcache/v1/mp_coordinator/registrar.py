@@ -13,7 +13,7 @@ logged and retried, and it never takes the MP server down.
 """
 
 # Standard
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import asyncio
 import contextlib
 
@@ -34,6 +34,11 @@ from lmcache.v1.rpc_utils import get_ip
 logger = init_logger(__name__)
 
 _DEFAULT_HEARTBEAT_INTERVAL = 5.0
+
+
+def _no_memory_capacities() -> Sequence[ModuleMemoryCapacity]:
+    """Declare no memory capacity. Default for callers that report none."""
+    return ()
 
 
 async def register(
@@ -105,7 +110,9 @@ async def keep_registered(
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     p2p_advertised_url: str = "",
     mq_port: int = 0,
-    memory_capacities: Sequence[ModuleMemoryCapacity] = (),
+    memory_capacities: Callable[[], Sequence[ModuleMemoryCapacity]] = (
+        _no_memory_capacities
+    ),
 ) -> None:
     """Register, heartbeat on a timer, and deregister on cancellation.
 
@@ -129,8 +136,12 @@ async def keep_registered(
             when P2P is disabled.
         mq_port: Port of this server's ZMQ message-queue server for P2P lookup
             RPCs. 0 when P2P is disabled.
-        memory_capacities: This server's per-compartment memory capacities,
-            resent on every re-registration. Empty declares nothing.
+        memory_capacities: Probe returning this server's per-compartment
+            memory capacities. Called once per registration rather than
+            captured up front, so a re-registration after a runtime
+            reconfiguration publishes the topology as it is *then* --
+            adapters added or removed since boot are reflected. Returning
+            an empty sequence declares nothing.
     """
     base_url = coordinator_url.rstrip("/")
     ip = advertise_ip or get_ip()
@@ -147,7 +158,7 @@ async def keep_registered(
                         instance_id=instance_id,
                         p2p_advertised_url=p2p_advertised_url,
                         mq_port=mq_port,
-                        memory_capacities=memory_capacities,
+                        memory_capacities=memory_capacities(),
                     )
                     logger.info("Registered with coordinator as %s", assigned_id)
                 else:

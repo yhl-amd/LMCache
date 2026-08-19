@@ -65,31 +65,6 @@ class DevDaxL1MemoryManager(L1MemoryManager):
         self._config = config
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
-        # Retained separately: a hybrid tier spans two mediums, and each
-        # is a distinct compartment in the fleet memory view.
-        self._devdax_size_in_bytes = devdax_size
-        self._local_size_in_bytes = local_size
-
-    def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
-        """Return the configured capacity of each medium in this tier.
-
-        A hybrid configuration backs objects with both the Device-DAX
-        arena and a local DRAM pool, so it reports two compartments; a
-        pure Device-DAX tier reports one.
-
-        Note this is the *configured* topology, not the live arena pool:
-        devices mapped later via :meth:`add_device` are overflow capacity
-        and are not counted here.
-
-        Returns:
-            Configured bytes per medium, omitting mediums sized zero.
-        """
-        capacities: dict[L1BackendType, int] = {}
-        if self._devdax_size_in_bytes > 0:
-            capacities[L1BackendType.DEVDAX] = self._devdax_size_in_bytes
-        if self._local_size_in_bytes > 0:
-            capacities[L1BackendType.DRAM] = self._local_size_in_bytes
-        return capacities
 
     def get_backend_type(self, memory_obj: MemoryObj) -> L1BackendType:
         """Return the storage medium backing ``memory_obj``.
