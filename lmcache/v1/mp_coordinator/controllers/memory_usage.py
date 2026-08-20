@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-server, per-module byte usage view for the MP coordinator.
 
+Tracks the ``(instance_id, tier, backend)`` axis that the per-salt
 :class:`~lmcache.v1.mp_coordinator.controllers.usage_manager.L2UsageManager`
-answers "how many L2 bytes does this tenant hold?" -- it aggregates by
-``cache_salt`` and ignores every tier but L2. Memory pressure asks a
-different question: "how full is this server's L1 pool, and each of its L2
-adapters?" That is the ``(instance_id, tier, backend)`` axis, which the
-per-salt view folds away, so this is a second view over the same admitted
-event stream rather than an accessor on the first.
-
-Both tiers are tracked: L1 is the DRAM pool that actually fills up, and it
-is invisible to the per-salt view.
+folds away, and covers L1 as well as L2.
 """
 
 # Future
@@ -27,11 +20,8 @@ from lmcache.v1.mp_coordinator.api import CacheEventBatch, CacheEventType
 
 logger = init_logger(__name__)
 
-# Owner value marking a fleet-shared pool -- storage several instances
-# mount (one S3 bucket, one CXL region). The same convention the key
-# directory and the per-salt usage view upsert on: shared placements are
-# owned by nobody in particular, so they are counted once for the fleet
-# instead of once per instance that reports them.
+# Owner value for a fleet-shared pool (one S3 bucket, one CXL region), which
+# is counted once for the fleet instead of once per reporting instance.
 SHARED_OWNER = ""
 
 
@@ -43,9 +33,8 @@ class ModuleUsage:
         tier: The compartment's cache tier (``L1`` or ``L2``).
         backend: The storage backend within the tier.
         used_bytes: Bytes currently placed in this compartment.
-        shared: ``True`` when the compartment is a fleet-shared pool, in
-            which case ``used_bytes`` is the pool's total and belongs to
-            no single instance.
+        shared: ``True`` for a fleet-shared pool, whose ``used_bytes`` is
+            the pool total and belongs to no single instance.
     """
 
     tier: Tier
@@ -67,13 +56,11 @@ class MemoryUsageTracker:
     """Thread-safe per-``(instance, tier, backend)`` byte usage view.
 
     A :class:`~lmcache.v1.mp_coordinator.ingest.event_broadcaster.CacheEventConsumer`:
-    mutations arrive through :meth:`consume` and :meth:`fence_instance`,
-    reads through :meth:`get_for_instance`, :meth:`get_shared`, and
-    :meth:`get_instances`.
+    :meth:`consume` and :meth:`fence_instance` mutate; :meth:`get_for_instance`,
+    :meth:`get_shared`, and :meth:`get_instances` read.
 
-    Sizes are remembered per placement because ``DELETE`` entries carry no
-    ``size_bytes`` -- only ``STORE`` does -- so the tracker must know what
-    it admitted in order to know what a free released.
+    Per-placement sizes are remembered because ``DELETE`` entries carry no
+    ``size_bytes``.
     """
 
     def __init__(self) -> None:
@@ -81,16 +68,15 @@ class MemoryUsageTracker:
         self._lock = threading.Lock()
         self._placement_sizes: dict[_PlacementId, int] = {}
         self._bytes_by_compartment: dict[_CompartmentId, int] = {}
-        # L1 placements per instance, so a fence can drop exactly what
-        # that instance reported without scanning every placement.
+        # L1 placements per instance, so a fence drops exactly what that
+        # instance reported without scanning every placement.
         self._l1_placements: dict[str, set[_PlacementId]] = {}
 
     def consume(self, batch: CacheEventBatch) -> None:
         """Account one gate-admitted batch.
 
-        ``STORE`` upserts a placement's bytes (a delta on re-store),
-        ``DELETE`` removes them, and ``ACCESS`` is ignored -- it refreshes
-        recency and carries no placement identity or size.
+        ``STORE`` upserts a placement's bytes, ``DELETE`` removes them, and
+        ``ACCESS`` is ignored -- it carries no placement identity or size.
 
         Args:
             batch: The admitted batch.
@@ -121,9 +107,8 @@ class MemoryUsageTracker:
     def fence_instance(self, instance_id: str) -> None:
         """Discard the L1 bytes ``instance_id`` reported.
 
-        Called on a restart or a departure. L1 lives in the reporting
-        process, so its bytes die with it; L2 bytes outlive the reporter
-        and leave only through ``DELETE``, so they are kept.
+        L1 dies with the reporting process; L2 outlives it and leaves only
+        through ``DELETE``, so L2 bytes are kept.
 
         Args:
             instance_id: The instance whose reported L1 state is void.
@@ -137,15 +122,13 @@ class MemoryUsageTracker:
     def get_for_instance(self, instance_id: str) -> tuple[ModuleUsage, ...]:
         """Return the compartments ``instance_id`` privately owns.
 
-        Shared pools are excluded: they belong to the fleet, not to this
-        instance, and are read through :meth:`get_shared`.
-
         Args:
             instance_id: The server to report on.
 
         Returns:
             One :class:`ModuleUsage` per compartment holding bytes, sorted
-            by ``(tier, backend)``. Empty when the instance holds none.
+            by ``(tier, backend)``. Shared pools are excluded; read them
+            through :meth:`get_shared`.
         """
         with self._lock:
             found = [
@@ -160,8 +143,8 @@ class MemoryUsageTracker:
 
         Returns:
             One :class:`ModuleUsage` per shared pool holding bytes, sorted
-            by ``(tier, backend)``. These totals are fleet-wide and must
-            not be summed across instances.
+            by ``(tier, backend)``. Totals are fleet-wide and must not be
+            summed across instances.
         """
         with self._lock:
             found = [
@@ -175,9 +158,8 @@ class MemoryUsageTracker:
         """Return the ids of instances currently holding bytes.
 
         Returns:
-            Sorted instance ids. An instance that has reported nothing (or
-            whose bytes were all freed) does not appear, so callers that
-            need the full fleet should iterate the registry instead.
+            Sorted instance ids. An instance holding no bytes is absent, so
+            callers needing the full fleet should iterate the registry.
         """
         with self._lock:
             owners = {

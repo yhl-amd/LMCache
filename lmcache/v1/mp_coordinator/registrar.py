@@ -65,10 +65,8 @@ async def register(
         mq_port: Port of this server's ZMQ message-queue server for P2P lookup
             RPCs. 0 when P2P is disabled.
         memory_capacities: This server's per-compartment memory capacities.
-            Empty declares nothing, and the coordinator then reports this
-            server's usage without a pressure ratio. Sent on every
-            registration, so a re-registration after reconfiguration
-            republishes the current topology.
+            Empty declares nothing, and usage is then reported without a
+            pressure ratio.
 
     Returns:
         The registered instance id (coordinator-assigned if ``instance_id`` was
@@ -137,11 +135,9 @@ async def keep_registered(
         mq_port: Port of this server's ZMQ message-queue server for P2P lookup
             RPCs. 0 when P2P is disabled.
         memory_capacities: Probe returning this server's per-compartment
-            memory capacities. Called once per registration rather than
-            captured up front, so a re-registration after a runtime
-            reconfiguration publishes the topology as it is *then* --
-            adapters added or removed since boot are reflected. Returning
-            an empty sequence declares nothing.
+            memory capacities. Called once per registration, not captured up
+            front, so a re-registration reflects runtime reconfiguration.
+            Returning an empty sequence declares nothing.
     """
     base_url = coordinator_url.rstrip("/")
     ip = advertise_ip or get_ip()

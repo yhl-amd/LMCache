@@ -254,21 +254,17 @@ class EncodedObjectKey:
 class ModuleMemoryCapacity:
     """One memory compartment's configured capacity on this server.
 
-    A compartment is the L1 pool of one backing medium, or one L2
-    adapter -- the same ``(tier, backend)`` axis cache events tag
-    placements with, so a capacity and a usage total join without
-    translation.
+    A compartment is the L1 pool of one backing medium, or one L2 adapter --
+    the same ``(tier, backend)`` axis cache events tag placements with.
 
     Attributes:
         tier: ``Tier.L1`` or ``Tier.L2``.
-        backend: The medium within the tier (``"dram"``, ``"devdax"``,
-            ``"gds"``, or an L2 adapter type name such as ``"s3"``).
-        capacity_bytes: Configured capacity. ``0`` means the component
-            declares no limit, which is the default for several L2
-            adapters and must be reported as unknown rather than as full.
-        shared: ``True`` when several instances mount this same pool, so
-            its capacity is fleet-scoped and must not be summed across
-            the servers that report it.
+        backend: Medium within the tier (``"dram"``, ``"devdax"``, ``"gds"``,
+            or an L2 adapter type name such as ``"s3"``).
+        capacity_bytes: Configured capacity. ``0`` means undeclared, reported
+            as unknown rather than as full.
+        shared: ``True`` when several instances mount this pool, so its
+            capacity must not be summed across them.
     """
 
     tier: "Tier"

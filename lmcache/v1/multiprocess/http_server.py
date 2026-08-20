@@ -138,10 +138,8 @@ async def lifespan(app: FastAPI):
                 heartbeat_interval=coordinator_config.heartbeat_interval,
                 p2p_advertised_url=mp_config.p2p_config.advertise_url,
                 mq_port=mp_config.port if mp_config.p2p_config.enabled else 0,
-                # Passed as a probe, not a snapshot: adapters can be added
-                # or removed at runtime, so a re-registration must publish the
-                # topology as it is then. Bound here so the registrar keeps no
-                # dependency on the engine.
+                # A probe, not a snapshot: adapters change at runtime, so a
+                # re-registration must publish the topology as it is then.
                 memory_capacities=engine.storage_manager.get_memory_capacities,
             )
         )

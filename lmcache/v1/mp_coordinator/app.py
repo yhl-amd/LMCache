@@ -95,8 +95,7 @@ def create_app(config: MPCoordinatorConfig) -> FastAPI:
     )
     prefetch_manager = PrefetchManager()
     # Memory pressure's two halves: usage from the event stream, capacity
-    # declared at registration. Kept apart because they arrive on different
-    # channels at very different rates.
+    # declared at registration.
     memory_usage = MemoryUsageTracker()
     server_config = ServerConfigRegistry()
     # Resolves pin requests' token_ids to object keys; must match the fleet's

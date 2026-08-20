@@ -203,8 +203,7 @@ class L1Manager:
         else:
             self._memory_manager = L1MemoryManager(config.memory_config)
 
-        # Retained so configured capacity stays derivable from the one
-        # source of truth rather than re-read from live allocator state.
+        # Retained so configured capacity comes from one source.
         self._config = config
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
@@ -845,14 +844,11 @@ class L1Manager:
     def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
         """Return the configured capacity of each L1 backing medium.
 
-        Unlike :meth:`get_memory_usage`'s total, which some allocators
-        report as the currently grown heap, this is the operator-declared
-        size and is therefore stable from boot -- the correct denominator
-        for an occupancy figure.
+        Unlike :meth:`get_memory_usage`'s total, which can be the grown heap,
+        this is the declared size and is stable from boot.
 
         Returns:
-            Configured bytes per medium; a hybrid tier reports one entry
-            per medium, and mediums sized zero are omitted.
+            Configured bytes per medium; mediums sized zero are omitted.
         """
         return configured_l1_capacity_bytes(self._config)
 
@@ -884,15 +880,10 @@ class L1Manager:
             if entry.is_temporary:
                 temporary += 1
         used, total = self._memory_manager.get_memory_usage()
-        # ``memory_total_bytes`` is whatever the allocator currently backs,
-        # which on the default lazy tier is the grown heap rather than the
-        # operator's cap -- so it climbs as the pool warms up.
-        # ``memory_configured_bytes`` is the declared size, stable from boot.
-        # Reported as one number to match this dict's flat shape; the
-        # per-medium split (a hybrid Device-DAX tier spans two) is available
-        # from ``get_configured_capacity_bytes()``. ``0`` means nothing was
-        # configured.
-        configured = sum(configured_l1_capacity_bytes(self._config).values())
+        # ``memory_total_bytes`` is what the allocator currently backs (the
+        # grown heap on the lazy tier); this is the declared size. Summed to
+        # match this dict's flat shape; ``0`` means undeclared.
+        configured = sum(self.get_configured_capacity_bytes().values())
         return {
             "is_healthy": self._memory_manager.memcheck(),
             "total_object_count": len(self._objects),

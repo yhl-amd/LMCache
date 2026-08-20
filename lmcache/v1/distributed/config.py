@@ -217,37 +217,24 @@ def configured_l1_capacity_bytes(
 ) -> dict[L1BackendType, int]:
     """Return the configured L1 capacity of each backing medium.
 
-    The single source for "how large is L1", derived from configuration
-    rather than from a live allocator. ``L1Manager.get_memory_usage()``
-    reports the *currently backed* size, which on the default lazy tier is
-    the grown heap and therefore climbs as the pool warms; the configured
-    size is stable from boot and is the denominator an occupancy figure
-    needs.
+    The single source for "how large is L1". Unlike
+    ``L1Manager.get_memory_usage()``, whose total is the grown heap on the
+    lazy tier, this is stable from boot. Keyed per medium because a hybrid
+    Device-DAX tier spans two, and L1 cache events tag placements the same
+    way. Reports the *configured* topology, so devices added later via
+    ``add_device`` are not counted.
 
-    Keyed per medium because one tier can span several: a hybrid
-    Device-DAX tier backs objects with both ``devdax`` and ``dram``, and
-    L1 cache events tag placements the same way, so capacity and usage
-    land on the same compartments.
-
-    This mirrors the tier selection in :class:`L1Manager` and the arena
-    split in ``DevDaxL1MemoryManager``; it reports the *configured*
-    topology, so devices mapped later via ``add_device`` are overflow
-    capacity and are not counted.
-
-    Expects a **normalized** config. ``normalize_storage_manager_config``
-    back-fills ``devdax_size_in_bytes`` from a matching DAX L2 adapter and
-    drops that adapter, so a hand-built config that never passed through
-    ``StorageManagerConfig.__post_init__`` reads as pure Device-DAX where
-    the deployment is hybrid. Callers that hold an
-    :class:`L1ManagerConfig` from a constructed ``StorageManagerConfig``
-    (``L1Manager``, the usage telemetry) satisfy this by construction.
+    Expects a **normalized** config: ``normalize_storage_manager_config``
+    back-fills ``devdax_size_in_bytes`` from a matching DAX L2 adapter, so a
+    hand-built config reads as pure Device-DAX where the deployment is
+    hybrid. Callers holding a config from a constructed
+    ``StorageManagerConfig`` satisfy this by construction.
 
     Args:
         config: The L1 manager configuration.
 
     Returns:
-        Configured bytes per medium, omitting mediums sized zero. Empty
-        when nothing is configured.
+        Configured bytes per medium, omitting mediums sized zero.
     """
     if config.gds_l1_config is not None:
         size = config.gds_l1_config.size_in_bytes
@@ -255,9 +242,8 @@ def configured_l1_capacity_bytes(
 
     memory_config = config.memory_config
     if memory_config.devdax_path:
-        # Mirrors DevDaxL1MemoryManager.__init__: an unset devdax size
-        # means the whole tier is Device-DAX, otherwise size_in_bytes is
-        # the local DRAM half of a hybrid pool.
+        # Mirrors DevDaxL1MemoryManager.__init__: an unset devdax size means
+        # the whole tier is Device-DAX, else size_in_bytes is the DRAM half.
         devdax_size = memory_config.devdax_size_in_bytes or memory_config.size_in_bytes
         local_size = (
             memory_config.size_in_bytes if memory_config.devdax_size_in_bytes else 0

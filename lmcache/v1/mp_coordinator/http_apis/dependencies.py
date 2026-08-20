@@ -48,11 +48,9 @@ class CoordinatorContext:
             MP-server cache events (eventually consistent).
         event_gate: Ingest entry point for the fleet cache-event stream
             (``POST /events``).
-        memory_usage: Per-``(instance, tier, backend)`` byte usage, the
-            numerator of a memory-pressure reading. A second view over the
-            same admitted event stream as ``eviction_controller.usage``,
-            which folds that axis away to aggregate by ``cache_salt``.
-        server_config: Each MP server's declared module capacities, the
+        memory_usage: Per-``(instance, tier, backend)`` byte usage; the
+            numerator of a pressure reading.
+        server_config: Declared module capacities per MP server; the
             denominator. Populated at registration.
     """
 

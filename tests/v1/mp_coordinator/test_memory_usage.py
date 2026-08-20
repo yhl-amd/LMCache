@@ -107,8 +107,7 @@ class TestConsume:
         assert _used(tracker, "mp-1") == {("l1", "dram"): 250}
 
     def test_delete_releases_the_remembered_size(self) -> None:
-        # DELETE entries carry no size_bytes, so the tracker must have
-        # remembered what the STORE admitted.
+        # DELETE carries no size; the tracker must remember the STORE's.
         tracker = MemoryUsageTracker()
         tracker.consume(
             _batch(1, Tier.L1, "dram", CacheEventType.STORE, _store(1, 100))
@@ -140,8 +139,7 @@ class TestSharedPools:
         ]
 
     def test_two_instances_reporting_one_pool_count_it_once(self) -> None:
-        # The whole point of the shared flag: one bucket mounted twice is
-        # still one bucket. Summing per reporter would double it.
+        # One pool mounted twice is still one pool; summing per reporter doubles it.
         tracker = MemoryUsageTracker()
         tracker.consume(
             _batch(1, Tier.L2, "s3", CacheEventType.STORE, _store(1, 900), shared=True)
@@ -169,8 +167,7 @@ class TestSharedPools:
 
 class TestFenceInstance:
     def test_drops_l1_and_keeps_l2(self) -> None:
-        # L1 lives in the reporting process and dies with it; L2 outlives
-        # the reporter and leaves only through DELETE.
+        # L1 dies with the reporting process; L2 outlives it, leaving only via DELETE.
         tracker = MemoryUsageTracker()
         tracker.consume(
             _batch(1, Tier.L1, "dram", CacheEventType.STORE, _store(1, 100))

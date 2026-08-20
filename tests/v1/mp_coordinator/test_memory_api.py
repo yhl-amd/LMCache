@@ -35,11 +35,10 @@ def client() -> TestClient:
 def _ctx(client: TestClient) -> CoordinatorContext:
     """Return the coordinator context behind ``client``.
 
-    ``TestClient.app`` is typed as a bare ASGI callable, so the concrete
-    app type is restored once here rather than at each call site.
+    ``TestClient.app`` is a bare ASGI callable, so the cast happens here once.
 
     Args:
-        client: The test client wrapping a coordinator app.
+        client: Test client wrapping a coordinator app.
 
     Returns:
         That app's :class:`CoordinatorContext`.
@@ -126,7 +125,7 @@ class TestInstanceMemory:
         assert body["declared_capacity"] is True
 
     def test_undeclared_capacity_reports_no_ratio(self, client: TestClient) -> None:
-        # A bare byte count is honest; an inferred ratio would not be.
+        # A null ratio means unknown, not empty.
         _register(client, "mp-1", [])
         _ingest(client, "mp-1", Tier.L2, "fs", 7 * GIB, index=1)
 
@@ -140,7 +139,7 @@ class TestInstanceMemory:
     def test_declared_but_unused_module_is_reported_empty(
         self, client: TestClient
     ) -> None:
-        # A freshly started server should read as 0%, not as unmonitored.
+        # Declared but idle reads as 0%, not as unknown.
         _register(
             client,
             "mp-1",
@@ -151,8 +150,7 @@ class TestInstanceMemory:
         assert module["usage_ratio"] == pytest.approx(0.0)
 
     def test_ratio_above_one_is_not_clamped(self, client: TestClient) -> None:
-        # Over-full means the declared cap disagrees with what the tier
-        # admitted; hiding it would hide a misconfiguration.
+        # Over-full signals a misconfigured cap; clamping would hide it.
         _register(
             client, "mp-1", [{"tier": "l1", "backend": "dram", "capacity_bytes": GIB}]
         )
@@ -225,15 +223,14 @@ class TestFleetMemory:
         pool = body["shared_modules"][0]
         assert pool["used_bytes"] == 25 * GIB
         assert pool["usage_ratio"] == pytest.approx(0.25)
-        # And it is not double-counted onto either mounting instance.
+        # Counted once, never onto the mounting instances.
         for entry in body["instances"]:
             assert entry["modules"] == []
 
     def test_disagreeing_shared_capacity_reads_as_undeclared(
         self, client: TestClient
     ) -> None:
-        # No basis for preferring one server's number, and taking the first
-        # would make the answer depend on registration order.
+        # Picking either would make the answer depend on registration order.
         _register(
             client,
             "mp-1",
@@ -294,7 +291,7 @@ class TestRegistration:
         assert backends == {("l1", "dram")}
 
     def test_registration_without_modules_is_accepted(self, client: TestClient) -> None:
-        # Backward compatibility: an MP server that predates this field.
+        # Backward compatibility with servers predating this field.
         response = client.post(
             "/instances",
             json={"instance_id": "mp-1", "ip": "10.0.0.1", "http_port": 8000},

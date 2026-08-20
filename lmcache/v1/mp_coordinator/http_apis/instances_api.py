@@ -47,9 +47,8 @@ async def register_instance(
     """
     instance_id = body.instance_id or f"mp-{uuid.uuid4().hex}"
     ctx = get_context(request)
-    # Capacity before membership: a memory read that finds the instance
-    # registered but its modules undeclared would report a bare byte count
-    # with no ratio, which reads as "no capacity" rather than "not yet told".
+    # Before membership, so a memory read never finds the instance
+    # registered with its modules still undeclared.
     ctx.server_config.declare(
         instance_id,
         [
@@ -113,10 +112,8 @@ async def deregister_instance(instance_id: str, request: Request) -> Response:
         logger.info("Deregistered instance %s", instance_id)
     else:
         logger.info("Instance %s not registered, skipping deregistration", instance_id)
-    # Drop the capacity declaration with the membership. A departed server's
-    # caps describe a process that no longer exists, and keeping them would
-    # grow without bound across a churning fleet. Its surviving L2 bytes are
-    # still reported, just without a ratio.
+    # Dropped with the membership; otherwise declarations grow without
+    # bound across a churning fleet. Surviving L2 bytes lose their ratio.
     ctx.server_config.forget(instance_id)
     return Response(status_code=204)
 

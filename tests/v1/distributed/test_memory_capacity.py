@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the MP server's memory-capacity declaration.
 
-Capacity is what the coordinator cannot derive from cache events, so these
-cover the two things that make the declaration trustworthy: that it reports
-the *configured* size rather than a lazily grown heap, and that a tier
-spanning several mediums reports one compartment per medium.
+Capacity comes from config, not from the lazily grown heap, and a tier
+spanning several mediums declares one compartment per medium.
 """
 
 # Standard
@@ -75,11 +73,7 @@ class _FakeL1Manager:
 
 
 class _StorageManagerStub:
-    """The two members ``get_memory_capacities`` reaches for.
-
-    Stands in for a real ``StorageManager`` so the method can be exercised
-    without ``__init__``, which allocates pinned memory and spawns threads.
-    """
+    """Stands in for a ``StorageManager``, minus its pinned-memory ``__init__``."""
 
     def __init__(
         self,
@@ -103,9 +97,6 @@ def _capacities(
     adapters: list[tuple[_FakeDescriptor, _FakeAdapter]],
 ) -> list[ModuleMemoryCapacity]:
     """Run ``StorageManager.get_memory_capacities`` against fakes.
-
-    Called unbound on a structural stand-in; the cast records that the stub
-    satisfies only the part of ``StorageManager`` this method touches.
 
     Args:
         l1: Configured L1 capacity per backing medium.
@@ -173,8 +164,7 @@ class TestConfiguredL1Capacity:
         )
 
     def test_cpu_tier_reports_configured_size_not_grown_heap(self) -> None:
-        # The lazy allocator starts small and grows; reporting its current
-        # heap as the denominator would make a fresh server read ~100% full.
+        # The lazy allocator grows, so its current heap is not the capacity.
         config = self._config(size_in_bytes=40 * GIB)
         assert configured_l1_capacity_bytes(config) == {L1BackendType.DRAM: 40 * GIB}
 
@@ -215,8 +205,7 @@ class TestConfiguredL1Capacity:
         assert configured_l1_capacity_bytes(config) == {L1BackendType.GDS: 8 * GIB}
 
     def test_matches_the_devdax_manager_arena_split(self) -> None:
-        # The helper mirrors DevDaxL1MemoryManager.__init__; if that split
-        # ever changes, this is where the drift shows up.
+        # Mirrors DevDaxL1MemoryManager.__init__; catches drift in that split.
         memory_config = L1MemoryManagerConfig(
             size_in_bytes=10 * GIB,
             devdax_path="/dev/dax0.0",
@@ -235,8 +224,7 @@ class TestConfiguredL1Capacity:
         assert derived[L1BackendType.DRAM] == local_size
 
     def test_total_matches_what_usage_telemetry_reports(self) -> None:
-        # usage_telemetry sums the same derivation; a divergence would make
-        # the CLI, telemetry, and the fleet view disagree about one server.
+        # usage_telemetry sums the same derivation; drift would split the views.
         memory_config = L1MemoryManagerConfig(
             size_in_bytes=10 * GIB,
             devdax_path="/dev/dax0.0",
@@ -252,8 +240,6 @@ class TestConfiguredL1Capacity:
 
 class TestStorageManagerCapacities:
     def test_reports_l1_per_medium(self) -> None:
-        # A hybrid Device-DAX tier spans two mediums, and cache events tag
-        # L1 placements per medium, so capacity must match that shape.
         found = _capacities(
             {L1BackendType.DEVDAX: 100 * GIB, L1BackendType.DRAM: 10 * GIB}, []
         )
@@ -278,8 +264,7 @@ class TestStorageManagerCapacities:
         assert by_backend["s3"].capacity_bytes == 4000 * GIB
 
     def test_adapter_without_a_configured_cap_reports_zero(self) -> None:
-        # fs / mooncake / p2p / sagemaker return 0 unconditionally. Zero
-        # means unknown downstream, never "full".
+        # fs / mooncake / p2p / sagemaker return 0: undeclared, never "full".
         found = _capacities(
             {}, [(_FakeDescriptor("fs", shared=False), _FakeAdapter(0))]
         )
@@ -308,19 +293,13 @@ class TestStorageManagerCapacities:
     ],
 )
 def test_backend_names_match_the_cache_event_vocabulary(capacities: dict) -> None:
-    # Capacity joins usage on (tier, backend), so these strings must be the
-    # same ones L1 cache events carry.
+    # Capacity joins usage on (tier, backend); these strings must match events.
     found = _capacities(capacities, [])
     assert {c.backend for c in found} == {b.value for b in capacities}
 
 
 class TestReportStatusSharesTheSource:
-    """``report_status`` and the capacity API must not drift apart.
-
-    ``lmcache describe`` reads the status dict; the coordinator reads the
-    capacity API. Both must resolve to the same declared size, or the CLI
-    and the fleet view will disagree about the same server.
-    """
+    """``report_status`` and the capacity API must report the same size."""
 
     def _l1_manager(self, configured: dict[L1BackendType, int]) -> L1Manager:
         """Build an L1Manager over a fake memory manager.
@@ -329,15 +308,12 @@ class TestReportStatusSharesTheSource:
             configured: Capacity the fake reports per backing medium.
 
         Returns:
-            A manager whose ``report_status`` is callable. ``__init__`` is
-            skipped because it allocates pinned memory; the cast records
-            that the fake covers only the members ``report_status`` reads.
+            A manager whose ``report_status`` is callable.
         """
 
         class _MemoryManager:
             def get_memory_usage(self) -> tuple[int, int]:
-                # Deliberately unequal to the configured total: this is the
-                # lazily grown heap, which is what the old field reported.
+                # The grown heap, deliberately unequal to the configured total.
                 return (1 * GIB, 3 * GIB)
 
             def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
@@ -348,14 +324,12 @@ class TestReportStatusSharesTheSource:
 
         manager = L1Manager.__new__(L1Manager)
         manager._memory_manager = cast("L1ManagerProtocol", _MemoryManager())
-        # Capacity is now derived from config, so the manager needs one that
-        # yields exactly `configured`.
+        # Capacity derives from config, so it must yield exactly `configured`.
         manager._config = _config_yielding(configured)
         manager._objects = {}
         manager._write_ttl_seconds = 600
         manager._read_ttl_seconds = 600
-        # report_status is lock-guarded; the real __init__ is skipped here
-        # because it allocates pinned memory.
+        # report_status is lock-guarded; the pinned-memory __init__ is skipped.
         manager._lock = threading.Lock()
         return manager
 

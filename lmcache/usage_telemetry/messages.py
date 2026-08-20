@@ -222,10 +222,8 @@ class MPServerMessage(UsageMessage):
 
         l1_config = storage_manager_config.l1_manager_config
         memory_config = l1_config.memory_config
-        # Sizes come from the shared derivation so this and the fleet
-        # memory view cannot disagree about the same server. The medium
-        # label stays here: it is this message's own vocabulary, and its
-        # exact strings are part of the reported wire format.
+        # Shared derivation, so this and the fleet memory view agree. The
+        # medium label stays here: its exact strings are wire format.
         l1_size_bytes = sum(configured_l1_capacity_bytes(l1_config).values())
         if l1_config.gds_l1_config is not None:
             l1_medium = "gds"

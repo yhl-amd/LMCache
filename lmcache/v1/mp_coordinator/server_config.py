@@ -1,18 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-MP-server memory configuration declared at registration.
 
-The cache-event stream tells the coordinator how many bytes a module
-*holds*; it never tells it how many that module *can* hold. Capacity is
-configuration -- it changes when a server boots and when it is
-reconfigured, not once per cache event -- so servers declare it on
-``POST /instances`` and this registry is where the fleet's declarations
-live. Joining a declaration to a usage total is what turns a byte count
-into a pressure reading.
-
-This module stores declarations only. It does not read cache events, does
-not compute pressure, and does not track liveness -- membership stays
-:class:`~lmcache.v1.mp_coordinator.registry.InstanceRegistry`'s job, which
-is why capacity lives here rather than on ``MPInstance``.
+Cache events report bytes held, never bytes holdable, so servers declare
+capacity on ``POST /instances`` and this registry stores it. Declarations
+only: no event handling, no pressure math, no liveness -- membership stays
+:class:`~lmcache.v1.mp_coordinator.registry.InstanceRegistry`'s job.
 """
 
 # Future
@@ -24,16 +16,10 @@ from dataclasses import dataclass
 import threading
 
 # First Party
-from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import Tier
 
-logger = init_logger(__name__)
-
-# ``capacity_bytes`` value meaning "this server declared no cap for this
-# module". Distinct from a real cap, which is always positive: an adapter
-# with no configured limit (the default for fs / mooncake / p2p /
-# sagemaker) genuinely has no denominator, and reporting one as ``0``
-# capacity would read as permanently full.
+# ``capacity_bytes`` sentinel meaning "no cap declared". Real caps are always
+# positive; an unlimited adapter reported as 0 would read as permanently full.
 UNDECLARED_CAPACITY = 0
 
 
@@ -41,23 +27,18 @@ UNDECLARED_CAPACITY = 0
 class ModuleCapacity:
     """One memory compartment's declared capacity on one MP server.
 
-    A "module" here is a compartment that owns bytes: the L1 pool, or one
-    L2 adapter. This is the same ``(tier, backend)`` axis the cache-event
-    stream reports placements on, so a declaration and a usage total join
-    without translation.
+    A module is the L1 pool or one L2 adapter, keyed on the same
+    ``(tier, backend)`` axis cache events report placements on.
 
     Attributes:
-        tier: The cache tier this compartment belongs to (``L1`` or
-            ``L2``; never ``ALL``).
-        backend: The storage backend within the tier (``"dram"``,
-            ``"cxl"``, ``"fs"``, ``"s3"``, ...). Non-empty.
+        tier: Cache tier (``L1`` or ``L2``; never ``ALL``).
+        backend: Storage backend within the tier (``"dram"``, ``"cxl"``,
+            ``"fs"``, ``"s3"``, ...). Non-empty.
         capacity_bytes: Declared capacity in bytes, or
-            :data:`UNDECLARED_CAPACITY` when the server has no configured
-            limit for this compartment.
-        shared: ``True`` when this backend is a storage domain several
-            instances mount (one S3 bucket, one CXL pool). Fleet-scoped
-            capacity, so it must not be summed across the instances that
-            declare it.
+            :data:`UNDECLARED_CAPACITY` when no limit is configured.
+        shared: ``True`` when several instances mount one storage domain
+            (one S3 bucket, one CXL pool). Fleet-scoped: count once, never
+            sum across declaring instances.
     """
 
     tier: Tier
@@ -66,7 +47,7 @@ class ModuleCapacity:
     shared: bool = False
 
     def __post_init__(self) -> None:
-        """Enforce intrinsic invariants.
+        """Validate the declaration.
 
         Raises:
             ValueError: If ``backend`` is empty, ``capacity_bytes`` is
@@ -85,14 +66,8 @@ class ModuleCapacity:
 class ServerConfigRegistry:
     """Thread-safe store of each MP server's declared module capacities.
 
-    Declarations arrive through :meth:`declare` (from the registration
-    handler) and are dropped through :meth:`forget` (on deregistration).
-    Reads go through :meth:`get` and :meth:`get_all`.
-
-    A re-registration replaces a server's declaration wholesale rather
-    than merging: a server that dropped an L2 adapter must not keep the
-    old compartment's capacity, and replacement is the only way to say so
-    with a full declaration.
+    :meth:`declare` replaces a server's declaration wholesale, so a dropped
+    L2 adapter's capacity does not linger.
     """
 
     def __init__(self) -> None:
@@ -105,13 +80,12 @@ class ServerConfigRegistry:
 
         Args:
             instance_id: The declaring server's id. Non-empty.
-            modules: Its compartments. An empty sequence records that the
-                server declared nothing, which reads back as no known
-                capacity rather than as zero capacity.
+            modules: Its compartments. Empty records that the server declared
+                nothing, which reads back as unknown capacity, not zero.
 
         Raises:
-            ValueError: If ``instance_id`` is empty, or two entries share
-                a ``(tier, backend)`` identity.
+            ValueError: If ``instance_id`` is empty, or two entries share a
+                ``(tier, backend)`` identity.
         """
         if not instance_id:
             raise ValueError("instance_id must be non-empty")
@@ -144,8 +118,7 @@ class ServerConfigRegistry:
         """Return a snapshot of every server's declarations.
 
         Returns:
-            A copy mapping ``instance_id`` to its compartments; mutating it
-            does not affect the registry.
+            A copy mapping ``instance_id`` to its compartments.
         """
         with self._lock:
             return dict(self._by_instance)

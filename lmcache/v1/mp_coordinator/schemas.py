@@ -76,23 +76,19 @@ def decode_tokens(tokens_b64: str) -> np.ndarray:
 
 
 class ModuleCapacityModel(BaseModel):
-    """One memory compartment's declared capacity, as sent at registration.
+    """One memory compartment's declared capacity, sent at registration.
 
-    A compartment is the L1 pool or one L2 adapter -- the same
-    ``(tier, backend)`` axis cache events report placements on, so a
-    declaration joins a usage total without translation.
+    A compartment is the L1 pool or one L2 adapter, on the same
+    ``(tier, backend)`` axis cache events report placements on.
 
     Attributes:
-        tier: ``l1`` or ``l2``. ``all`` is rejected: a capacity has to name
-            the compartment it bounds.
-        backend: Storage backend within the tier (``"dram"``, ``"s3"``,
-            ...). Non-empty.
-        capacity_bytes: Declared capacity. ``0`` means the server has no
-            configured limit for this compartment, which is the default
-            for several L2 adapters and is reported as unknown rather than
-            as full.
-        shared: ``True`` when several instances mount this same pool, so
-            its capacity is fleet-scoped and must not be summed.
+        tier: ``l1`` or ``l2``; ``all`` is rejected.
+        backend: Storage backend within the tier (``"dram"``, ``"s3"``, ...).
+            Non-empty.
+        capacity_bytes: Declared capacity. ``0`` means undeclared, reported as
+            unknown rather than as full.
+        shared: ``True`` when several instances mount this pool, so its
+            capacity must not be summed.
     """
 
     tier: Tier
@@ -136,12 +132,10 @@ class RegisterRequest(BaseModel):
         mq_port: Port of the instance's ZMQ message-queue server that P2P peers
             send lookup/unlock RPCs to, reachable at the instance's ``ip``.
             Optional -- 0 when P2P is disabled.
-        memory_modules: The server's per-compartment memory capacities (L1
-            pool, one entry per L2 adapter). Optional -- an empty list means
-            the server declared nothing, and its usage is then reported
-            without a pressure ratio. A re-registration replaces the
-            previous declaration wholesale, so a server that dropped an
-            adapter must send its full current set.
+        memory_modules: Per-compartment memory capacities (L1 pool, one entry
+            per L2 adapter). Empty means nothing was declared, and usage is
+            then reported without a pressure ratio. A re-registration replaces
+            the previous declaration wholesale.
     """
 
     instance_id: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
@@ -278,18 +272,15 @@ class ModuleMemoryStatus(BaseModel):
     Attributes:
         tier: ``l1`` or ``l2``.
         backend: Storage backend within the tier.
-        shared: ``True`` when this is a fleet-shared pool. Its bytes are
-            counted once for the fleet, not once per mounting instance.
-        used_bytes: Bytes the compartment currently holds, derived from the
-            admitted cache-event stream.
-        capacity_bytes: The server's declared capacity, or ``0`` when it
-            declared none.
+        shared: ``True`` for a fleet-shared pool, whose bytes are counted
+            once for the fleet, not once per mounting instance.
+        used_bytes: Bytes held, derived from the admitted cache-event stream.
+        capacity_bytes: Declared capacity, or ``0`` when none was declared.
         usage_ratio: ``used_bytes / capacity_bytes``, or ``None`` when no
-            capacity was declared. ``None`` rather than a sentinel: there
-            is no ratio to report, and a number would be read as one.
-            Values above ``1.0`` are possible and are not clamped -- the
-            declared cap can be smaller than what the tier actually
-            admitted, and hiding that would hide a misconfiguration.
+            capacity was declared -- ``None``, not a sentinel, since a number
+            would be read as a real occupancy. Values above ``1.0`` are not
+            clamped: they mean the declared cap disagrees with what the tier
+            admitted.
     """
 
     tier: Tier
@@ -305,15 +296,12 @@ class InstanceMemoryStatus(BaseModel):
 
     Attributes:
         instance_id: The server this describes.
-        registered: ``True`` when the server is currently in the instance
-            registry. A server can hold L2 bytes while deregistered, so a
-            status can legitimately appear with this ``False``.
-        declared_capacity: ``True`` when the server declared any module
-            capacity at registration. When ``False`` every module's
-            ``usage_ratio`` is ``None``.
-        modules: Its privately-owned compartments, sorted by tier then
-            backend. Shared pools are reported once at the fleet level
-            instead.
+        registered: ``True`` when currently in the instance registry. A
+            deregistered server can still hold L2 bytes, so ``False`` is valid.
+        declared_capacity: ``True`` when any module capacity was declared.
+            When ``False`` every module's ``usage_ratio`` is ``None``.
+        modules: Privately-owned compartments, sorted by tier then backend.
+            Shared pools are reported at the fleet level instead.
     """
 
     instance_id: str
@@ -327,10 +315,9 @@ class FleetMemoryResponse(BaseModel):
 
     Attributes:
         instances: Per-server status, sorted by ``instance_id``.
-        shared_modules: Fleet-shared compartments, counted once. Their
-            capacity is reported only when every declaring server agrees
-            on it; a disagreement is reported as undeclared, since there
-            is no basis for picking one.
+        shared_modules: Fleet-shared compartments, counted once. Capacity is
+            reported only when every declaring server agrees; a disagreement
+            reads as undeclared.
     """
 
     instances: list[InstanceMemoryStatus] = Field(default_factory=list)

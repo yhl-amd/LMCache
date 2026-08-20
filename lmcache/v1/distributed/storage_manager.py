@@ -837,21 +837,15 @@ class StorageManager:
     def get_memory_capacities(self) -> list[ModuleMemoryCapacity]:
         """Report every memory compartment's configured capacity.
 
-        The declaration an MP server sends the coordinator at
-        registration, joined there against event-derived usage to yield a
-        pressure reading. Capacity is configuration, so this is read once
-        per registration rather than polled.
-
-        L1 is reported per backing medium (a hybrid Device-DAX tier spans
-        two). L2 is reported per adapter, keeping each adapter's own
-        ``shared`` flag: a pool several instances mount is fleet-scoped
-        and must be counted once, not once per mount. An adapter whose
-        ``get_usage()`` raises is skipped rather than reported with a
-        wrong capacity.
+        Sent to the coordinator at registration and joined there against
+        event-derived usage. L1 is reported per backing medium; L2 per
+        adapter, keeping each adapter's ``shared`` flag so a pool several
+        instances mount is counted once. An adapter whose ``get_usage()``
+        raises is skipped rather than reported with a wrong capacity.
 
         Returns:
-            One entry per compartment. Adapters that declare no limit
-            appear with ``capacity_bytes == 0``, meaning unknown.
+            One entry per compartment. ``capacity_bytes == 0`` means the
+            adapter declares no limit.
         """
         capacities = [
             ModuleMemoryCapacity(

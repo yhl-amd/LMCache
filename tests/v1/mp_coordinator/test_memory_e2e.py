@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """End-to-end tests for the fleet memory-pressure API.
 
-Drives a real uvicorn-served coordinator over real sockets the way an mp
-server does: register (declaring module capacities), publish cache events to
-``POST /events``, then read ``GET /memory``. Event bodies are built with the
-same ``CacheEventsRequest(...).model_dump(mode="json")`` call the mp server's
-``HttpCacheEventSink`` uses, so the wire encoding under test is the real one
-rather than a hand-written JSON approximation.
+Drives a uvicorn-served coordinator over real sockets: register with module
+capacities, publish to ``POST /events``, read ``GET /memory``. Bodies use the
+same ``CacheEventsRequest`` dump ``HttpCacheEventSink`` sends, so the wire
+encoding under test is the real one.
 """
 
 # Standard
@@ -79,7 +77,7 @@ def coordinator():
 
 
 def _register(base: str, instance_id: str, modules: list[dict[str, object]]) -> None:
-    """Register an mp server declaring ``modules``, over real HTTP."""
+    """Register an mp server declaring ``modules``."""
     response = requests.post(
         f"{base}/instances",
         json={
@@ -105,7 +103,7 @@ def _publish(
     incarnation: int = 1,
     event_type: CacheEventType = CacheEventType.STORE,
 ) -> None:
-    """Publish one cache-event batch to ``POST /events``, over real HTTP."""
+    """Publish one cache-event batch to ``POST /events``."""
     key = ObjectKey(
         chunk_hash=bytes([index]) * 32,
         model_name="model",
@@ -191,11 +189,9 @@ def test_pressure_from_registration_and_events_over_real_http(coordinator) -> No
 
 
 def test_undeclared_capacity_serializes_as_null_over_the_wire(coordinator) -> None:
-    """No capacity means no ratio -- and JSON ``null``, not a sentinel number.
+    """Undeclared capacity (``capacity_bytes == 0``) serializes as ``null``.
 
-    ``capacity_bytes == 0`` is the default for several L2 adapters, so this
-    is the common path, and a numeric stand-in here would be read as a real
-    occupancy by anything consuming the API.
+    A numeric stand-in would read as real occupancy.
     """
     _register(coordinator, "mp-1", [])
     _publish(coordinator, "mp-1", Tier.L2, "fs", 7 * GIB, index=1)
@@ -206,7 +202,7 @@ def test_undeclared_capacity_serializes_as_null_over_the_wire(coordinator) -> No
     assert module["capacity_bytes"] == 0
     assert module["usage_ratio"] is None
     assert body["declared_capacity"] is False
-    # Raw text, so a JSON `null` cannot be confused with a client-side default.
+    # Raw text, so a client-side default cannot mask a missing null.
     assert '"usage_ratio":null' in requests.get(
         f"{coordinator}/memory/mp-1", timeout=2
     ).text.replace(" ", "")
@@ -223,7 +219,7 @@ def test_shared_pool_counted_once_across_mounts_over_real_http(coordinator) -> N
     _register(coordinator, "mp-1", [shared])
     _register(coordinator, "mp-2", [shared])
 
-    # Both servers report the same shared placement, as they really would.
+    # Both servers report the same shared placement.
     _publish(coordinator, "mp-1", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
     _publish(coordinator, "mp-2", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
 
@@ -232,7 +228,7 @@ def test_shared_pool_counted_once_across_mounts_over_real_http(coordinator) -> N
     pool = fleet["shared_modules"][0]
     assert pool["used_bytes"] == 25 * GIB
     assert pool["usage_ratio"] == pytest.approx(0.25)
-    # And it is attributed to neither mounting server.
+    # Attributed to neither mounting server.
     for entry in fleet["instances"]:
         assert entry["modules"] == []
 
@@ -263,9 +259,7 @@ def test_restart_fences_l1_but_keeps_l2_over_real_http(coordinator) -> None:
     )
 
     after = requests.get(f"{coordinator}/memory/mp-1", timeout=2).json()
-    # Pre-restart L1 is gone; only the new incarnation's 2 GiB remains.
     assert _module(after, "l1", "dram")["used_bytes"] == 2 * GIB
-    # L2 survived the restart untouched.
     assert _module(after, "l2", "fs")["used_bytes"] == 50 * GIB
 
 
@@ -299,21 +293,16 @@ def test_unknown_instance_is_404_over_real_http(coordinator) -> None:
 
 
 def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> None:
-    """The two halves of the feature meet: what an MP server actually
-    produces is what the coordinator can actually join against.
+    """What an MP server declares is what the coordinator can join against.
 
-    Uses the real conversion the registrar performs on the output shape of
-    ``StorageManager.get_memory_capacities()``, so a drift between the
-    producer's compartment identity and the event stream's ``(tier,
-    backend)`` would surface here as a missing ratio rather than in
-    production.
+    Drift between the producer's compartment identity and the event stream's
+    ``(tier, backend)`` surfaces here as a missing ratio.
     """
     # First Party
     from lmcache.v1.distributed.api import ModuleMemoryCapacity
     from lmcache.v1.mp_coordinator.schemas import ModuleCapacityModel, RegisterRequest
 
-    # Exactly what get_memory_capacities() returns for a hybrid Device-DAX
-    # server with a private fs adapter and a shared, uncapped bucket.
+    # Shape get_memory_capacities() returns for a hybrid Device-DAX server.
     produced = [
         ModuleMemoryCapacity(Tier.L1, "devdax", 100 * GIB, False),
         ModuleMemoryCapacity(Tier.L1, "dram", 10 * GIB, False),
@@ -339,7 +328,7 @@ def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> 
     )
     assert response.status_code == 200, response.text
 
-    # Usage arrives on the event stream, tagged the way L1/L2 events tag it.
+    # Usage arrives on the event stream.
     _publish(coordinator, "mp-1", Tier.L1, "devdax", 25 * GIB, index=1, seq=1)
     _publish(coordinator, "mp-1", Tier.L1, "dram", 5 * GIB, index=2, seq=2)
     _publish(coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=3, seq=3)
@@ -348,13 +337,12 @@ def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> 
     status = requests.get(f"{coordinator}/memory/mp-1", timeout=2).json()
     assert status["declared_capacity"] is True
 
-    # Every declared compartment joins -- the producer's backend strings and
-    # the event stream's agree, including the hybrid tier's two mediums.
+    # Every declared compartment joins, including both hybrid L1 mediums.
     assert _module(status, "l1", "devdax")["usage_ratio"] == pytest.approx(0.25)
     assert _module(status, "l1", "dram")["usage_ratio"] == pytest.approx(0.5)
     assert _module(status, "l2", "fs")["usage_ratio"] == pytest.approx(0.25)
 
-    # The uncapped shared bucket is fleet-scoped and still has no denominator.
+    # The uncapped shared bucket is fleet-scoped and has no denominator.
     pool = requests.get(f"{coordinator}/memory", timeout=2).json()["shared_modules"]
     assert [(p["backend"], p["used_bytes"], p["usage_ratio"]) for p in pool] == [
         ("s3", 9 * GIB, None)
