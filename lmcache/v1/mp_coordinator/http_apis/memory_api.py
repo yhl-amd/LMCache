@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fleet memory-pressure endpoints for the MP coordinator.
 
-Joins per-compartment byte totals (``MemoryUsageTracker``) with the
-capacities declared at registration (``ServerConfigRegistry``). Read-only:
-never evicts, throttles, or pushes. A ``null`` usage ratio means capacity is
-undeclared, not that the compartment is empty.
+Joins per-compartment byte totals (``CacheUsageManager``'s per-instance
+rollup) with the capacities declared at registration
+(``ServerConfigRegistry``). Read-only: never evicts, throttles, or pushes. A
+``null`` usage ratio means capacity is undeclared, not that the compartment
+is empty.
 """
 
 # Third Party
@@ -12,65 +13,88 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 # First Party
 from lmcache.v1.distributed.api import Tier
-from lmcache.v1.mp_coordinator.controllers.memory_usage import (
-    ModuleUsage,
-)
+from lmcache.v1.mp_coordinator.controllers.usage_manager import CacheUsageManager
 from lmcache.v1.mp_coordinator.http_apis.dependencies import get_context
 from lmcache.v1.mp_coordinator.schemas import (
     FleetMemoryResponse,
     InstanceMemoryStatus,
     ModuleMemoryStatus,
 )
-from lmcache.v1.mp_coordinator.server_config import (
-    UNDECLARED_CAPACITY,
-    ModuleCapacity,
-)
+from lmcache.v1.mp_coordinator.server_config import UNDECLARED_CAPACITY, ModuleCapacity
 
 router = APIRouter()
 
+# ``CacheUsageManager`` keys fleet-shared pools under this instance id: their
+# bytes belong to the fleet, so they are counted once, never per mount.
+_SHARED_OWNER = ""
 
-def _to_status(usage: ModuleUsage, capacity_bytes: int) -> ModuleMemoryStatus:
+_TIERS = (Tier.L1, Tier.L2)
+
+
+def _usage_by_owner(
+    usage_manager: CacheUsageManager,
+) -> dict[str, dict[tuple[Tier, str], int]]:
+    """Collect used bytes for every owner across both tiers.
+
+    Args:
+        usage_manager: The fleet usage view.
+
+    Returns:
+        ``instance_id`` -> ``(tier, backend)`` -> bytes. Shared pools appear
+        under :data:`_SHARED_OWNER`.
+    """
+    by_owner: dict[str, dict[tuple[Tier, str], int]] = {}
+    for tier in _TIERS:
+        for owner, backends in usage_manager.get_bytes_by_instance(tier).items():
+            for backend, used in backends.items():
+                by_owner.setdefault(owner, {})[(tier, backend)] = used
+    return by_owner
+
+
+def _to_status(
+    tier: Tier, backend: str, used_bytes: int, capacity_bytes: int, shared: bool
+) -> ModuleMemoryStatus:
     """Join one compartment's usage to its declared capacity.
 
     Args:
-        usage: The compartment's current byte total.
-        capacity_bytes: Its declared capacity, or
-            :data:`~lmcache.v1.mp_coordinator.server_config.UNDECLARED_CAPACITY`
-            (0) if undeclared.
+        tier: The compartment's cache tier.
+        backend: Storage backend within the tier.
+        used_bytes: Bytes the compartment holds.
+        capacity_bytes: Declared capacity, or :data:`UNDECLARED_CAPACITY`.
+        shared: Whether this is a fleet-shared pool.
 
     Returns:
-        The joined status; ``usage_ratio`` is ``None`` when capacity is
-        undeclared.
+        The joined status; ``usage_ratio`` is ``None`` with no capacity to
+        divide by.
     """
-    ratio = (
-        usage.used_bytes / capacity_bytes
-        if capacity_bytes > UNDECLARED_CAPACITY
-        else None
-    )
     return ModuleMemoryStatus(
-        tier=usage.tier,
-        backend=usage.backend,
-        shared=usage.shared,
-        used_bytes=usage.used_bytes,
+        tier=tier,
+        backend=backend,
+        shared=shared,
+        used_bytes=used_bytes,
         capacity_bytes=capacity_bytes,
-        usage_ratio=ratio,
+        usage_ratio=(
+            used_bytes / capacity_bytes
+            if capacity_bytes > UNDECLARED_CAPACITY
+            else None
+        ),
     )
 
 
 def _instance_status(
     instance_id: str,
-    usage_modules: tuple[ModuleUsage, ...],
+    used: dict[tuple[Tier, str], int],
     declared: tuple[ModuleCapacity, ...],
     registered: bool,
 ) -> InstanceMemoryStatus:
     """Build one server's status from its usage and its declaration.
 
-    Declared-but-unfilled compartments are reported with ``used_bytes=0`` so
-    a freshly started server does not look unmonitored.
+    Declared-but-empty compartments report ``used_bytes=0`` so a freshly
+    started server does not look unmonitored.
 
     Args:
         instance_id: The server being described.
-        usage_modules: Its privately-owned compartments holding bytes.
+        used: Its ``(tier, backend)`` byte totals.
         declared: Its declared capacities.
         registered: Whether it is currently in the instance registry.
 
@@ -78,27 +102,22 @@ def _instance_status(
         The assembled status.
     """
     capacities = {(m.tier, m.backend): m.capacity_bytes for m in declared}
-    seen: set[tuple[Tier, str]] = set()
-    statuses: list[ModuleMemoryStatus] = []
-    for usage in usage_modules:
-        identity = (usage.tier, usage.backend)
-        seen.add(identity)
-        statuses.append(
-            _to_status(usage, capacities.get(identity, UNDECLARED_CAPACITY))
+    statuses = [
+        _to_status(
+            tier,
+            backend,
+            used_bytes,
+            capacities.get((tier, backend), UNDECLARED_CAPACITY),
+            shared=False,
         )
+        for (tier, backend), used_bytes in used.items()
+    ]
     for module in declared:
-        identity = (module.tier, module.backend)
-        if identity in seen or module.shared:
+        if module.shared or (module.tier, module.backend) in used:
             continue
         statuses.append(
             _to_status(
-                ModuleUsage(
-                    tier=module.tier,
-                    backend=module.backend,
-                    used_bytes=0,
-                    shared=False,
-                ),
-                module.capacity_bytes,
+                module.tier, module.backend, 0, module.capacity_bytes, shared=False
             )
         )
     statuses.sort(key=lambda m: (m.tier.value, m.backend))
@@ -113,32 +132,29 @@ def _instance_status(
 def _shared_capacities(
     declarations: dict[str, tuple[ModuleCapacity, ...]],
 ) -> dict[tuple[Tier, str], int]:
-    """Resolve each shared pool's capacity across every server that declares it.
+    """Resolve each shared pool's capacity across its declaring servers.
 
-    A shared pool is one physical store, so declarations are agreed on, never
-    summed; disagreement resolves to undeclared rather than to whichever
-    server registered first.
+    One pool is one store, so declarations should agree. A disagreement reads
+    as undeclared rather than picking one, which would make the answer depend
+    on registration order.
 
     Args:
         declarations: Every server's declared compartments.
 
     Returns:
-        Mapping from ``(tier, backend)`` to the agreed capacity, or to
-        :data:`~lmcache.v1.mp_coordinator.server_config.UNDECLARED_CAPACITY`
-        where servers disagree.
+        ``(tier, backend)`` -> agreed capacity, or :data:`UNDECLARED_CAPACITY`.
     """
     claims: dict[tuple[Tier, str], set[int]] = {}
     for modules in declarations.values():
         for module in modules:
-            if not module.shared:
-                continue
-            claims.setdefault((module.tier, module.backend), set()).add(
-                module.capacity_bytes
-            )
-    resolved: dict[tuple[Tier, str], int] = {}
-    for identity, values in claims.items():
-        resolved[identity] = values.pop() if len(values) == 1 else UNDECLARED_CAPACITY
-    return resolved
+            if module.shared:
+                claims.setdefault((module.tier, module.backend), set()).add(
+                    module.capacity_bytes
+                )
+    return {
+        identity: values.pop() if len(values) == 1 else UNDECLARED_CAPACITY
+        for identity, values in claims.items()
+    }
 
 
 @router.get("/memory")
@@ -149,32 +165,40 @@ async def fleet_memory(request: Request) -> FleetMemoryResponse:
         request: The incoming request, carrying the coordinator context.
 
     Returns:
-        A :class:`FleetMemoryResponse`. A server appears if it is registered,
-        still holds bytes, or has declared capacity.
+        A :class:`FleetMemoryResponse`. A server appears when it is
+        registered, still holds bytes, or declared capacity, so a
+        deregistered server whose L2 placements survive is not dropped.
     """
     ctx = get_context(request)
-    usage = ctx.memory_usage
     declarations = ctx.server_config.get_all()
     registered = {instance.instance_id for instance in ctx.registry.all_instances()}
+    by_owner = _usage_by_owner(ctx.usage_manager)
+    owned = {owner for owner in by_owner if owner != _SHARED_OWNER}
 
-    instance_ids = sorted(registered | set(usage.get_instances()) | set(declarations))
     instances = [
         _instance_status(
             instance_id=instance_id,
-            usage_modules=usage.get_for_instance(instance_id),
+            used=by_owner.get(instance_id, {}),
             declared=declarations.get(instance_id, ()),
             registered=instance_id in registered,
         )
-        for instance_id in instance_ids
+        for instance_id in sorted(registered | owned | set(declarations))
     ]
 
     shared_caps = _shared_capacities(declarations)
-    shared = [
-        _to_status(
-            module, shared_caps.get((module.tier, module.backend), UNDECLARED_CAPACITY)
-        )
-        for module in usage.get_shared()
-    ]
+    shared = sorted(
+        (
+            _to_status(
+                tier,
+                backend,
+                used_bytes,
+                shared_caps.get((tier, backend), UNDECLARED_CAPACITY),
+                shared=True,
+            )
+            for (tier, backend), used_bytes in by_owner.get(_SHARED_OWNER, {}).items()
+        ),
+        key=lambda m: (m.tier.value, m.backend),
+    )
     return FleetMemoryResponse(instances=instances, shared_modules=shared)
 
 
@@ -190,21 +214,21 @@ async def instance_memory(instance_id: str, request: Request) -> InstanceMemoryS
         That server's :class:`InstanceMemoryStatus`.
 
     Raises:
-        HTTPException: 404 if the id is unknown -- not registered, holding no
-            bytes, and declaring no capacity.
+        HTTPException: 404 when the coordinator knows nothing about the id --
+            not registered, holding no bytes, and having declared nothing.
     """
     ctx = get_context(request)
     declared = ctx.server_config.get(instance_id)
-    usage_modules = ctx.memory_usage.get_for_instance(instance_id)
+    used = _usage_by_owner(ctx.usage_manager).get(instance_id, {})
     registered = ctx.registry.contains(instance_id)
-    if not registered and not declared and not usage_modules:
+    if not registered and not declared and not used:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"unknown instance {instance_id!r}",
         )
     return _instance_status(
         instance_id=instance_id,
-        usage_modules=usage_modules,
+        used=used,
         declared=declared,
         registered=registered,
     )

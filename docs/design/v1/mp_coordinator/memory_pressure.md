@@ -5,7 +5,7 @@ compartments are. It joins two things the coordinator holds separately: byte
 usage derived from the admitted cache-event stream, and capacity declared by
 each server at registration. Neither is a pressure reading on its own.
 
-Code: `lmcache/v1/mp_coordinator/controllers/memory_usage.py` (usage view),
+Code: `lmcache/v1/mp_coordinator/controllers/usage_manager.py` (usage view),
 `lmcache/v1/mp_coordinator/server_config.py` (capacity registry),
 `lmcache/v1/mp_coordinator/http_apis/memory_api.py` (REST endpoints),
 `lmcache/v1/distributed/storage_manager.py` (MP-server capacity source),
@@ -18,13 +18,10 @@ whether that is a lot, because nothing tells it how many bytes the tier *can*
 hold. Pressure is `used / capacity`, and the cache-event stream carries only
 the numerator.
 
-The existing per-salt view cannot supply the numerator either.
-`L2UsageManager` answers "how many L2 bytes does this tenant hold?" — it
-aggregates by `cache_salt`, returns early on any tier but L2, and folds
-`instance_id` into a placement key it never exposes. Memory pressure asks a
-different question on a different axis, and needs L1, which is the pool that
-actually fills up. So the usage half is a **second consumer** over the same
-admitted stream, not an accessor on the first. `L2UsageManager` is unchanged.
+The usage half needs no new tracking. `CacheUsageManager` already rolls the
+admitted cache-event stream up per `(instance_id, backend)` for both tiers —
+`get_bytes_by_instance(tier)` — which is exactly the axis a pressure reading
+needs. This capability adds only the denominator.
 
 ## Why capacity does not ride the event stream
 
@@ -61,7 +58,7 @@ L2 adapter / L1 manager publish                     │  capacity
                                           └─ CacheEventBroadcaster          │
                                              ├─ KeyDirectory                │
                                              ├─ FleetEvictionController     │
-                                             └─ MemoryUsageTracker  ────────┤
+                                             └─ CacheUsageManager  ─────────┤
                                                   (instance, tier, backend) │
                                                                     usage   │
                                                                             ▼

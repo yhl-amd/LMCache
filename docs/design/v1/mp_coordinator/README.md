@@ -217,14 +217,18 @@ entire meaning is "exempt from eviction", so the pin set is eviction
 state that the cache-control endpoints write, not the reverse.
 
 
-## Fleet memory pressure (`server_config.py` + `controllers/memory_usage.py`)
+## Fleet memory pressure (`server_config.py`)
 
 `GET /memory` answers how full each server's memory compartments are, by
 joining two halves that arrive on different channels at very different
-rates: **usage** from the admitted cache-event stream, and **capacity**
-declared in `POST /instances`. Capacity is configuration — it changes at
-boot and at reconfiguration, not per event — so it rides registration, and a
+rates: **usage** from `CacheUsageManager.get_bytes_by_instance`, already
+maintained off the admitted cache-event stream, and **capacity** declared in
+`POST /instances`. Capacity is configuration — it changes at boot and at
+reconfiguration, not per event — so it rides registration, and a
 reconfigured server republishes by re-registering.
+
+The endpoint adds no usage tracking of its own: the per-instance,
+per-backend rollup it needs is exactly what the usage manager publishes.
 
 `ServerConfigRegistry` holds the declarations. It lives outside
 `registry.py` because that file is membership only; a capacity is not a way

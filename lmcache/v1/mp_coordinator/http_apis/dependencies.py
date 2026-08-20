@@ -20,7 +20,6 @@ import httpx
 from lmcache.v1.mp_coordinator.controllers.eviction_controller import (
     FleetEvictionController,
 )
-from lmcache.v1.mp_coordinator.controllers.memory_usage import MemoryUsageTracker
 from lmcache.v1.mp_coordinator.controllers.prefetch_manager import PrefetchManager
 from lmcache.v1.mp_coordinator.controllers.usage_manager import CacheUsageManager
 from lmcache.v1.mp_coordinator.ingest.event_gate import EventGate
@@ -48,8 +47,6 @@ class CoordinatorContext:
             MP-server cache events (eventually consistent).
         event_gate: Ingest entry point for the fleet cache-event stream
             (``POST /events``).
-        memory_usage: Per-``(instance, tier, backend)`` byte usage; the
-            numerator of a pressure reading.
         server_config: Declared module capacities per MP server; the
             denominator. Populated at registration.
     """
@@ -61,7 +58,6 @@ class CoordinatorContext:
     token_hasher: TokenHasher
     key_directory: KeyDirectory
     event_gate: EventGate
-    memory_usage: MemoryUsageTracker
     server_config: ServerConfigRegistry
 
 
