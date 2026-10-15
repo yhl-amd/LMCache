@@ -12,6 +12,8 @@ for per-instance locks on the shared temporary GPU buffer.
 
 # Standard
 from concurrent.futures import Future
+import itertools
+import os
 import queue
 import threading
 
@@ -22,6 +24,13 @@ logger = init_logger(__name__)
 
 # Sentinel object to signal worker shutdown
 _SHUTDOWN = object()
+
+# Handler names that jump ahead of everything else queued on the same worker,
+# e.g. LMCACHE_AFFINITY_PRIORITY=retrieve: a load is latency-critical (the
+# request waits for it), a store is not. Unset keeps strict FIFO.
+_PRIORITY_NAMES = frozenset(
+    n for n in os.environ.get("LMCACHE_AFFINITY_PRIORITY", "").split(",") if n
+)
 
 
 class AffinityThreadPool:
@@ -41,7 +50,11 @@ class AffinityThreadPool:
         thread_name_prefix: str = "affinity",
     ) -> None:
         self._num_workers = max_workers
-        self._queues: list[queue.Queue] = [queue.Queue() for _ in range(max_workers)]
+        self._queues: list[queue.Queue] = [
+            queue.PriorityQueue() if _PRIORITY_NAMES else queue.Queue()
+            for _ in range(max_workers)
+        ]
+        self._seq = itertools.count()
         self._threads: list[threading.Thread] = []
         # Maps an affinity_key -> the worker slot (thread index) bound to it.
         self._key_to_slot: dict[int, int] = {}
@@ -75,6 +88,8 @@ class AffinityThreadPool:
     def _worker(q: queue.Queue) -> None:
         while True:
             item = q.get()
+            if isinstance(q, queue.PriorityQueue):
+                item = item[2]
             if item is _SHUTDOWN:
                 break
             future, fn, args, kwargs = item
@@ -138,7 +153,12 @@ class AffinityThreadPool:
         """
         future: Future = Future()
         slot = self._slot_for_key(affinity_key)
-        self._queues[slot].put((future, fn, args, kwargs))
+        item = (future, fn, args, kwargs)
+        if _PRIORITY_NAMES:
+            prio = 0 if getattr(fn, "__name__", "") in _PRIORITY_NAMES else 1
+            self._queues[slot].put((prio, next(self._seq), item))
+        else:
+            self._queues[slot].put(item)
         return future
 
     def shutdown(self, wait: bool = True) -> None:
@@ -148,7 +168,7 @@ class AffinityThreadPool:
         until all workers have exited.
         """
         for q in self._queues:
-            q.put(_SHUTDOWN)
+            q.put((2, next(self._seq), _SHUTDOWN) if _PRIORITY_NAMES else _SHUTDOWN)
         if wait:
             for t in self._threads:
                 t.join()

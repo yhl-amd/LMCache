@@ -2,6 +2,7 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
+import os
 from dataclasses import dataclass
 from functools import partial
 import threading
@@ -29,6 +30,31 @@ from lmcache.v1.multiprocess.token_hasher import TokenHasher
 logger = init_logger(__name__)
 
 
+_SESSION_HASH = os.environ.get("LMCACHE_LOOKUP_SESSION_HASH", "") == "1"
+
+
+def _session_chunk_hashes(
+    ctx: MPCacheServerContext, key: IPCCacheServerKey, start: int, end: int
+) -> list[bytes] | None:
+    """Chunk hashes for ``[start, end)`` already cached in the request's session.
+
+    The lookup (or a store) of the same request hashed this prefix once; reuse it
+    instead of rehashing the whole prompt. Guarded by comparing the last chunk's
+    tokens; returns None (caller rehashes) when not cached that far.
+    """
+    session = ctx.session_manager.get(key.request_id)
+    if session is None:
+        return None
+    cs = ctx.chunk_size
+    with session._lock:
+        if session.num_chunks_processed * cs < end or end <= start:
+            return None
+        tokens = session.token_ids
+        if len(tokens) < end or list(tokens[end - cs : end]) != list(key.token_ids[end - cs : end]):
+            return None
+        return [TokenHasher.hash_to_bytes(h) for h in session.chunk_hashes[start // cs : end // cs]]
+
+
 def resolve_prefetched_obj_keys(
     ctx: MPCacheServerContext,
     key: IPCCacheServerKey,
@@ -42,9 +68,15 @@ def resolve_prefetched_obj_keys(
     A worker-specific key resolves only that worker's shard (or one MLA reader
     share), which is required for per-instance RETRIEVE failure cleanup.
     """
-    chunk_hashes = ctx.token_hasher.compute_chunk_hashes(
-        list(key.token_ids), start=key.start, end=key.end
-    )
+    chunk_hashes = None
+    if _SESSION_HASH:
+        eff = min(key.end, len(key.token_ids))
+        eff -= eff % ctx.chunk_size
+        chunk_hashes = _session_chunk_hashes(ctx, key, key.start, eff)
+    if chunk_hashes is None:
+        chunk_hashes = ctx.token_hasher.compute_chunk_hashes(
+            list(key.token_ids), start=key.start, end=key.end
+        )
     if not chunk_hashes:
         return []
 
@@ -203,9 +235,20 @@ class LookupModule:
 
         num_kv_readers = key.require_num_kv_readers()
 
-        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
-            list(key.token_ids), end=key.end
-        )
+        if _SESSION_HASH:
+            # Hash through the session so later stores, free_lookup_locks and
+            # end_session of this request reuse the same hashes.
+            eff = min(key.end, len(key.token_ids))
+            eff -= eff % self._ctx.chunk_size
+            _session = self._ctx.session_manager.get_or_create(key.request_id)
+            _session.set_tokens(list(key.token_ids))
+            chunk_hashes = [
+                TokenHasher.hash_to_bytes(h) for h in _session.get_hashes(0, eff)
+            ]
+        else:
+            chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
+                list(key.token_ids), end=key.end
+            )
         if not chunk_hashes:
             self._register_prefetch_job(
                 _PrefetchJob(
