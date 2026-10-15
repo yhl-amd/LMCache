@@ -69,6 +69,17 @@ class IPCCacheServerKey:
     # lookups reject it.
     num_kv_readers: int = field(default=0, compare=False)
 
+    # Client-computed chunk hashes for the complete chunks in [start, end),
+    # concatenated (CHUNK_HASH_BYTES each, blake3 rolling hashes identical to
+    # TokenHasher). When set, token_ids is empty: the client never resends the
+    # token prefix, and the server neither decodes nor hashes it.
+    chunk_hashes: bytes = b""
+
+    # The client reuses its producer IPC events (each recorded at most
+    # IPC_EVENT_MAX_RECORDS times) and accepts pooled completion events, whose
+    # handles carry POOLED_EVENT_MAGIC. Transport hint, not cache identity.
+    pooled_events: bool = field(default=False, compare=False)
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
@@ -145,7 +156,31 @@ class IPCCacheServerKey:
             request_id=self.request_id,
             cache_salt=self.cache_salt,
             request_configs=self.request_configs,
+            chunk_hashes=self.chunk_hashes,
+            pooled_events=self.pooled_events,
         )
+
+    def split_chunk_hashes(self) -> list[bytes]:
+        """Return ``chunk_hashes`` as one bytes object per chunk."""
+        b = self.chunk_hashes
+        if len(b) % CHUNK_HASH_BYTES:
+            raise ValueError(
+                f"chunk_hashes length {len(b)} is not a multiple of {CHUNK_HASH_BYTES}"
+            )
+        return [b[i : i + CHUNK_HASH_BYTES] for i in range(0, len(b), CHUNK_HASH_BYTES)]
+
+
+# Size of one client-computed (blake3) chunk hash in IPCCacheServerKey.chunk_hashes.
+CHUNK_HASH_BYTES = 32
+
+# Prefix of completion-event handles from a server's per-instance event pool. Such an
+# event is re-recorded for later operations and never destroyed while the instance is
+# registered, so the client may import it once and keep it.
+POOLED_EVENT_MAGIC = b"LMCPOOL1"
+
+# ROCm 7.2's IPCEvent::streamWait indexes signal[read_index] without "% 32", so a
+# producer event the server stream-waits on must not be recorded more than 32 times.
+IPC_EVENT_MAX_RECORDS = 31
 
 
 # Type exports

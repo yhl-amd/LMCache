@@ -8,9 +8,13 @@ transport and device-event futures stay under :mod:`lmcache.v1.multiprocess`.
 """
 
 # Standard
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
+import array
+import os
+import sys
 import threading
 import uuid
 
@@ -20,7 +24,10 @@ import zmq
 
 # First Party
 from lmcache.utils import EngineType, init_logger
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import (
+    IPC_EVENT_MAX_RECORDS,
+    IPCCacheServerKey,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
@@ -32,12 +39,118 @@ from lmcache.v1.multiprocess.transfer_context import (
 )
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
+from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 
 logger = init_logger(__name__)
 
 DEFAULT_MQ_TIMEOUT = 300.0
 DEFAULT_HEARTBEAT_INTERVAL = 10.0
+
+# Send client-computed chunk hashes instead of the token prefix (needs a blake3 server).
+_CLIENT_HASH = os.environ.get("LMCACHE_MP_CLIENT_HASH", "") == "1"
+# Reuse producer IPC events and accept pooled completion events.
+_POOLED_EVENTS = os.environ.get("LMCACHE_MP_POOLED_EVENTS", "") == "1"
+
+
+class _ChunkHashCache:
+    """Rolling chunk hashes per request, extended as the request's tokens grow.
+
+    Same hashes as the server's blake3 ``TokenHasher`` (each chunk hashes the
+    previous chunk's hash followed by its tokens as big-endian uint32), so keys
+    can carry ``[start, end)`` hashes instead of the whole token prefix. A changed
+    last-hashed chunk restarts the chain.
+    """
+
+    def __init__(self, chunk_size: int, max_requests: int = 1024) -> None:
+        # Third Party
+        import blake3
+
+        self._blake3 = blake3.blake3
+        self._chunk_size = chunk_size
+        self._none_hash = TokenHasher(chunk_size=chunk_size).none_hash
+        self._max_requests = max_requests
+        self._entries: OrderedDict[str, tuple[list[bytes], list[int]]] = (
+            OrderedDict()
+        )
+        self._lock = threading.Lock()
+
+    def hashes(self, request_id: str, token_ids: Sequence[int], end: int) -> list[bytes]:
+        """Hashes of the complete chunks in ``[0, min(end, len(token_ids)))``."""
+        cs = self._chunk_size
+        n = min(end, len(token_ids)) // cs
+        with self._lock:
+            hashes, tail = self._entries.pop(request_id, ([], []))
+        have = len(hashes)
+        if have and list(token_ids[(have - 1) * cs : have * cs]) != tail:
+            hashes, have = [], 0
+        if have < n:
+            packed = array.array("I", token_ids[have * cs : n * cs])
+            if sys.byteorder == "little":
+                packed.byteswap()
+            data = packed.tobytes()
+            prefix = hashes[-1] if hashes else self._none_hash
+            step = 4 * cs
+            for off in range(0, len(data), step):
+                prefix = self._blake3(prefix + data[off : off + step]).digest()
+                hashes.append(prefix)
+            tail = list(token_ids[(n - 1) * cs : n * cs])
+        with self._lock:
+            self._entries[request_id] = (hashes, tail)
+            while len(self._entries) > self._max_requests:
+                self._entries.popitem(last=False)
+        return hashes[:n]
+
+    def drop(self, request_id: str) -> None:
+        with self._lock:
+            self._entries.pop(request_id, None)
+
+
+def _hash_key_fields(
+    cache: _ChunkHashCache | None,
+    request_id: str,
+    token_ids: Sequence[int],
+    start: int,
+    end: int,
+    chunk_size: int,
+) -> dict[str, Any]:
+    """``token_ids``/``chunk_hashes`` fields of a key for ``[start, end)``."""
+    if cache is None:
+        return {"token_ids": tuple(token_ids)}
+    hashes = cache.hashes(request_id, token_ids, end)
+    return {"token_ids": (), "chunk_hashes": b"".join(hashes[start // chunk_size :])}
+
+
+class _ProducerEventPool:
+    """Producer IPC events reused across operations.
+
+    The engine records a new interprocess event per step; exporting it makes the
+    server import a new event per operation and destroy it afterwards, which
+    blocks the server until its GPU work drains. Instead each submission records
+    a pooled event at the current stream position (the engine's event was just
+    recorded there). Slots rotate so a late server waits on a recent record, and a
+    slot gets a new event after IPC_EVENT_MAX_RECORDS records.
+    """
+
+    def __init__(self, slots: int = 16) -> None:
+        self._events: list[Any] = [None] * slots
+        self._records = [0] * slots
+        self._next = 0
+        self._lock = threading.Lock()
+
+    def record(self) -> Any:
+        """Record the next pooled event on the current stream and return it."""
+        with self._lock:
+            slot = self._next % len(self._events)
+            self._next += 1
+            event = self._events[slot]
+            if event is None or self._records[slot] >= IPC_EVENT_MAX_RECORDS:
+                event = torch.cuda.Event(interprocess=True)
+                self._events[slot] = event
+                self._records[slot] = 0
+            event.record(torch.cuda.current_stream())
+            self._records[slot] += 1
+            return event
 
 
 class _IpcEvent(Protocol):
@@ -198,6 +311,9 @@ class AtomMPSchedulerAdapter:
         self._closed = False
         self._pending_lookups: set[str] = set()
         self._lookup_results: dict[str, int] = {}
+        self._hash_cache = (
+            _ChunkHashCache(self.lmcache_tokens_per_chunk) if _CLIENT_HASH else None
+        )
 
     def maybe_submit_lookup_request(
         self,
@@ -271,6 +387,8 @@ class AtomMPSchedulerAdapter:
 
     def end_session(self, request_id: str) -> None:
         """Ask the LMCache server to release request-scoped state."""
+        if self._hash_cache is not None:
+            self._hash_cache.drop(request_id)
         self._client.end_session(request_id)
 
     def shutdown(self) -> None:
@@ -297,10 +415,17 @@ class AtomMPSchedulerAdapter:
             # Each ATOM TP rank retrieves only its own rank-local object.
             num_kv_readers=1,
             worker_id=worker_id,
-            token_ids=tuple(token_ids),
             start=start,
             end=end,
             request_id=request_id,
+            **_hash_key_fields(
+                self._hash_cache,
+                request_id,
+                token_ids,
+                start,
+                end,
+                self.lmcache_tokens_per_chunk,
+            ),
         )
 
 
@@ -345,6 +470,10 @@ class AtomMPWorkerAdapter:
             raise
         self._client = client
         self.blocks_in_chunk = self.lmcache_tokens_per_chunk // block_size
+        self._hash_cache = (
+            _ChunkHashCache(self.lmcache_tokens_per_chunk) if _CLIENT_HASH else None
+        )
+        self._producer_events = _ProducerEventPool() if _POOLED_EVENTS else None
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._engine_group_infos: list[EngineGroupInfo] = []
         self._transfer_context: TransferContext | None = None
@@ -440,15 +569,22 @@ class AtomMPWorkerAdapter:
                 self._context_submission_leases.get(context, 0) + 1
             )
         try:
+            wire_event = (
+                event
+                if self._producer_events is None
+                else self._producer_events.record()
+            )
             future = context.submit_store(
                 request_id,
                 self._create_key(request_id, spec),
                 kv_caches,
                 block_ids,
-                event,
+                wire_event,
                 self.blocks_in_chunk,
             )
             future.retain_reference(event)
+            if wire_event is not event:
+                future.retain_reference(wire_event)
             self._track_operation_future(context, future)
         finally:
             self._release_submission_lease(context)
@@ -479,15 +615,22 @@ class AtomMPWorkerAdapter:
                 self._context_submission_leases.get(context, 0) + 1
             )
         try:
+            wire_event = (
+                event
+                if self._producer_events is None
+                else self._producer_events.record()
+            )
             future = context.submit_retrieve(
                 request_id,
                 self._create_key(request_id, spec),
                 kv_caches,
                 block_ids,
-                event,
+                wire_event,
                 self.blocks_in_chunk,
             )
             future.retain_reference(event)
+            if wire_event is not event:
+                future.retain_reference(wire_event)
             self._track_operation_future(context, future)
         finally:
             self._release_submission_lease(context)
@@ -817,8 +960,16 @@ class AtomMPWorkerAdapter:
             # Each ATOM TP rank retrieves only its own rank-local object.
             num_kv_readers=1,
             worker_id=self._parallel.worker_id,
-            token_ids=tuple(spec.token_ids),
             start=spec.start,
             end=spec.end,
             request_id=request_id,
+            pooled_events=self._producer_events is not None,
+            **_hash_key_fields(
+                self._hash_cache,
+                request_id,
+                spec.token_ids,
+                spec.start,
+                spec.end,
+                self.lmcache_tokens_per_chunk,
+            ),
         )

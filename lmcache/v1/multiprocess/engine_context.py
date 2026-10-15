@@ -304,15 +304,43 @@ class MPCacheServerContext:
             ValueError: If ``key.worker_id`` is ``None``.
         """
         session = self.session_manager.get_or_create(key.request_id)
-        session.set_tokens(list(key.token_ids))
+        if key.chunk_hashes:
+            chunk_hashes = self.client_chunk_hashes(key)
+            session.record_chunk_hashes(key.start, chunk_hashes)
+        else:
+            session.set_tokens(list(key.token_ids))
         if session.lookup_ipc_key is None:
             session.lookup_ipc_key = key.no_worker_id_version()
-        chunk_hashes = [
-            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
-        ]
+        if not key.chunk_hashes:
+            chunk_hashes = [
+                TokenHasher.hash_to_bytes(h)
+                for h in session.get_hashes(key.start, key.end)
+            ]
         if key.worker_id is None:
             raise ValueError("Must resolve keys with worker_id != None")
         return ipc_key_to_object_keys(key, chunk_hashes, object_group_ids)
+
+    def client_chunk_hashes(self, key: IPCCacheServerKey) -> list[bytes]:
+        """Validate and split the client-computed hashes of a hash-mode key.
+
+        Raises:
+            ValueError: If this server does not hash with blake3 (the client
+                hashes with it), or the hashes do not cover exactly the
+                complete chunks of ``[start, end)``.
+        """
+        if self.token_hasher.hash_algorithm_name != "blake3":
+            raise ValueError(
+                "client chunk hashes need a blake3 server, got "
+                f"{self.token_hasher.hash_algorithm_name}"
+            )
+        hashes = key.split_chunk_hashes()
+        want = key.end // self.chunk_size - key.start // self.chunk_size
+        if key.start % self.chunk_size or len(hashes) > max(want, 0):
+            raise ValueError(
+                f"client chunk hashes: {len(hashes)} hashes for [{key.start}, "
+                f"{key.end}) with chunk size {self.chunk_size}"
+            )
+        return hashes
 
     @staticmethod
     def _compute_shm_pool_info(

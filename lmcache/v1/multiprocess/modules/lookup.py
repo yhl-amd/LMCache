@@ -69,7 +69,9 @@ def resolve_prefetched_obj_keys(
     share), which is required for per-instance RETRIEVE failure cleanup.
     """
     chunk_hashes = None
-    if _SESSION_HASH:
+    if key.chunk_hashes:
+        chunk_hashes = ctx.client_chunk_hashes(key)
+    elif _SESSION_HASH:
         eff = min(key.end, len(key.token_ids))
         eff -= eff % ctx.chunk_size
         chunk_hashes = _session_chunk_hashes(ctx, key, key.start, eff)
@@ -235,7 +237,9 @@ class LookupModule:
 
         num_kv_readers = key.require_num_kv_readers()
 
-        if _SESSION_HASH:
+        if key.chunk_hashes:
+            chunk_hashes = self._ctx.client_chunk_hashes(key)
+        elif _SESSION_HASH:
             # Hash through the session so later stores, free_lookup_locks and
             # end_session of this request reuse the same hashes.
             eff = min(key.end, len(key.token_ids))
@@ -288,7 +292,7 @@ class LookupModule:
                         "chunk_hashes": chunk_hashes,
                         "model_name": model_name,
                         "chunk_size": self._ctx.chunk_size,
-                        "seq_len": len(key.token_ids),
+                        "seq_len": len(key.token_ids) or key.end,
                         "dtypes": [str(d) for d in layout_desc.dtypes],
                         "shapes": [list(s) for s in layout_desc.shapes],
                     },
@@ -301,7 +305,10 @@ class LookupModule:
             model_name, world_size
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
-        session.set_tokens(list(key.token_ids))
+        if key.chunk_hashes:
+            session.record_chunk_hashes(0, chunk_hashes)
+        else:
+            session.set_tokens(list(key.token_ids))
         session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
@@ -555,7 +562,9 @@ class LookupModule:
             )
             return
 
-        chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h) for h in session.known_chunk_hashes()
+        ]
         obj_keys = self._all_object_keys(session.lookup_ipc_key, chunk_hashes)
         # unified touch of all keys, which include retrieved and stored keys
         # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
