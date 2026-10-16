@@ -432,6 +432,13 @@ class AtomMPSchedulerAdapter:
 class AtomMPWorkerAdapter:
     """Worker-side ATOM registration and asynchronous transfer client."""
 
+    # The submit methods take ``producer_event_recorded=True``: the caller
+    # recorded ``event`` at the producing stream position itself and reuses it,
+    # so it goes out as is instead of a pooled event recorded here -- which
+    # would land on the calling thread's stream when the caller submits from a
+    # thread other than the one that ran the forward.
+    ACCEPTS_RECORDED_PRODUCER_EVENTS = True
+
     def __init__(
         self,
         server_url: str,
@@ -549,6 +556,7 @@ class AtomMPWorkerAdapter:
         request_id: str,
         spec: AtomMPTransferSpec,
         event: _IpcEvent,
+        producer_event_recorded: bool = False,
     ) -> MessagingFuture[bool] | None:
         """Submit an asynchronous ATOM store.
 
@@ -571,7 +579,7 @@ class AtomMPWorkerAdapter:
         try:
             wire_event = (
                 event
-                if self._producer_events is None
+                if self._producer_events is None or producer_event_recorded
                 else self._producer_events.record()
             )
             future = context.submit_store(
@@ -595,6 +603,7 @@ class AtomMPWorkerAdapter:
         request_id: str,
         spec: AtomMPTransferSpec,
         event: _IpcEvent,
+        producer_event_recorded: bool = False,
     ) -> MessagingFuture[bool] | None:
         """Submit an asynchronous ATOM retrieve.
 
@@ -617,7 +626,7 @@ class AtomMPWorkerAdapter:
         try:
             wire_event = (
                 event
-                if self._producer_events is None
+                if self._producer_events is None or producer_event_recorded
                 else self._producer_events.record()
             )
             future = context.submit_retrieve(
