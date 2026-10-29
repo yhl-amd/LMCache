@@ -9,8 +9,9 @@ transport and device-event futures stay under :mod:`lmcache.v1.multiprocess`.
 
 # Standard
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
+import os
 import threading
 import uuid
 
@@ -20,7 +21,10 @@ import zmq
 
 # First Party
 from lmcache.utils import EngineType, init_logger
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import (
+    IPC_EVENT_MAX_RECORDS,
+    IPCCacheServerKey,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
@@ -38,6 +42,42 @@ logger = init_logger(__name__)
 
 DEFAULT_MQ_TIMEOUT = 300.0
 DEFAULT_HEARTBEAT_INTERVAL = 10.0
+
+# Reuse producer IPC events and accept pooled completion events.
+_POOLED_EVENTS = os.environ.get("LMCACHE_MP_POOLED_EVENTS", "") == "1"
+
+
+class _ProducerEventPool:
+    """Producer IPC events reused across operations.
+
+    The engine records a new interprocess event per step; exporting it makes the
+    server import a new event per operation and destroy it afterwards, which
+    blocks until the server's GPU work on that device drains. Instead each
+    submission records a pooled event at the current stream position (the
+    engine's event was just recorded there). Slots rotate so a late server waits
+    on a recent record, and a slot gets a new event after IPC_EVENT_MAX_RECORDS
+    records.
+    """
+
+    def __init__(self, slots: int = 16) -> None:
+        self._events: list[Any] = [None] * slots
+        self._records = [0] * slots
+        self._next = 0
+        self._lock = threading.Lock()
+
+    def record(self) -> Any:
+        """Record the next pooled event on the current stream and return it."""
+        with self._lock:
+            slot = self._next % len(self._events)
+            self._next += 1
+            event = self._events[slot]
+            if event is None or self._records[slot] >= IPC_EVENT_MAX_RECORDS:
+                event = torch.cuda.Event(interprocess=True)
+                self._events[slot] = event
+                self._records[slot] = 0
+            event.record(torch.cuda.current_stream())
+            self._records[slot] += 1
+            return event
 
 
 class _IpcEvent(Protocol):
@@ -345,6 +385,7 @@ class AtomMPWorkerAdapter:
             raise
         self._client = client
         self.blocks_in_chunk = self.lmcache_tokens_per_chunk // block_size
+        self._producer_events = _ProducerEventPool() if _POOLED_EVENTS else None
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._engine_group_infos: list[EngineGroupInfo] = []
         self._transfer_context: TransferContext | None = None
@@ -440,15 +481,22 @@ class AtomMPWorkerAdapter:
                 self._context_submission_leases.get(context, 0) + 1
             )
         try:
+            wire_event = (
+                event
+                if self._producer_events is None
+                else self._producer_events.record()
+            )
             future = context.submit_store(
                 request_id,
                 self._create_key(request_id, spec),
                 kv_caches,
                 block_ids,
-                event,
+                wire_event,
                 self.blocks_in_chunk,
             )
             future.retain_reference(event)
+            if wire_event is not event:
+                future.retain_reference(wire_event)
             self._track_operation_future(context, future)
         finally:
             self._release_submission_lease(context)
@@ -479,15 +527,22 @@ class AtomMPWorkerAdapter:
                 self._context_submission_leases.get(context, 0) + 1
             )
         try:
+            wire_event = (
+                event
+                if self._producer_events is None
+                else self._producer_events.record()
+            )
             future = context.submit_retrieve(
                 request_id,
                 self._create_key(request_id, spec),
                 kv_caches,
                 block_ids,
-                event,
+                wire_event,
                 self.blocks_in_chunk,
             )
             future.retain_reference(event)
+            if wire_event is not event:
+                future.retain_reference(wire_event)
             self._track_operation_future(context, future)
         finally:
             self._release_submission_lease(context)
@@ -812,7 +867,7 @@ class AtomMPWorkerAdapter:
         request_id: str,
         spec: AtomMPTransferSpec,
     ) -> IPCCacheServerKey:
-        return IPCCacheServerKey.from_token_ids(
+        key = IPCCacheServerKey.from_token_ids(
             model_name=self._model_name,
             world_size=self._parallel.world_size,
             # Each ATOM TP rank retrieves only its own rank-local object.
@@ -823,3 +878,6 @@ class AtomMPWorkerAdapter:
             end=spec.end,
             request_id=request_id,
         )
+        if self._producer_events is not None:
+            key = replace(key, pooled_events=True)
+        return key

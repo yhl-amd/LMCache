@@ -80,6 +80,11 @@ class IPCCacheServerKey:
     # lookups reject it.
     num_kv_readers: int = field(default=0, compare=False)
 
+    # The client reuses its producer IPC events (each recorded at most
+    # IPC_EVENT_MAX_RECORDS times) and accepts pooled completion events, whose
+    # handles carry POOLED_EVENT_MAGIC. Transport hint, not cache identity.
+    pooled_events: bool = field(default=False, compare=False)
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
@@ -184,7 +189,18 @@ class IPCCacheServerKey:
             request_id=self.request_id,
             cache_salt=self.cache_salt,
             request_configs=self.request_configs,
+            pooled_events=self.pooled_events,
         )
+
+
+# Prefix of completion-event handles from a server's per-instance event pool. Such an
+# event is re-recorded for later operations and never destroyed while the instance is
+# registered, so the client may import it once and keep it.
+POOLED_EVENT_MAGIC = b"LMCPOOL1"
+
+# ROCm 7.2's IPCEvent::streamWait indexes signal[read_index] without "% 32", so a
+# producer event the server stream-waits on must not be recorded more than 32 times.
+IPC_EVENT_MAX_RECORDS = 31
 
 
 # Type exports
