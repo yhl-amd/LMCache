@@ -154,6 +154,24 @@ python aggregate.py runs dev-stock dev-pool dev-stock-w4
 - **多开 GPU worker 有帮助，但不如事件池**：`--max-gpu-workers 4` 让每个 rank 的销毁只卡住自己的线程，4 张卡不再串行。dev 原版 -w4 的 burst 是 3.19 / 5.05 s，而事件池只用 1 个 worker 就是 2.44 / 3.86 s。两者可以叠加：dev 事件池 -w4 的 sweep 延迟最低（52 / 96 ms）。
 - **越快的组越先碰到 L1 淘汰线**：写入相同字节数时，原版和事件池占用的 L1 内存一样（写入 8 万个 chunk 后 485 GB 对 484 GB，没有泄漏）；但事件池同时在途的写入更多，占用比例的峰值更高。L1 要留余量（我们 638 GB 数据用了 800 GB；事件池 -w4 组用 1200 GB 更稳妥）。
 
+## 7b. 持久 kernel（例如 ATOM mono）与 GPU 侧等待
+
+ROCm 7.2 上，server 对导入的 IPC event 做 `stream.wait_event`，实际是启动一个只有 1 个 work-item 的轮询 kernel（`streamOpsWait`，rocclr 默认 `GPU_STREAMOPS_CP_WAIT=false`），一直读 event 的信号，直到 client 的 GPU 工作把它写成 0。ATOM 的 mono decode kernel 要求所有 CTA 同时驻留（每个 CU 一个）并互相自旋等待。如果持久 kernel 派发时轮询 kernel 已经驻留、占住了它某个 CTA 需要的槽位，持久 kernel 等这个 CU，轮询 kernel 等持久 kernel 跑完后才会写的信号，两者互相卡死。用 `mono_hang_repro.py` 在单张 MI355X（ROCm 7.2.4）上复现：
+
+| 持久 kernel 占满 | `--mode stream`（原版 GPU 等待） | `--mode host` | `--mode gate` |
+|---|---|---|---|
+| 每个 CU（每 CU 2 个 1024 线程 CTA） | **第 2 轮卡死**（2 次都是） | 100 轮正常 | 100 轮正常 |
+| 每个 CU 一半（每 CU 1 个 CTA） | 100 轮正常 | – | – |
+
+两个默认关闭的开关，保证不在 GPU 上等一个还没完成的 event：
+
+- `LMCACHE_MP_SUBMIT_AFTER_PRODUCER=1`（client）：ATOM adapter 把每个 store/retrieve 交给后台线程，等 producer event 完成后再发送；`submit_*` 立即返回一个 future，发送前它报告未完成。引擎调用线程上每次 store 提交从 4.4 ms 降到 0.75 ms。
+- `LMCACHE_MP_HOST_WAIT_PRODUCER=1`（server）：用 `query()`（只读主机内存）检查 producer event，已完成就跳过 stream wait，未完成就在 CPU 上轮询，不再往 GPU 上排等待。
+
+两个都开时，`srvbench`（事件池、`--max-gpu-workers 4`、各 2 轮、L1 不扩容）性能不变：单条会话 store/retrieve p50 33/84 ms 对 33/85 ms，多会话 0.90/1.20 s 对 0.85/1.32 s，0 次失败。ROCm develop（[#5575](https://github.com/ROCm/rocm-systems/pull/5575)）把模拟的 IPC event 换成由 CP 等待的 ROCr IPC 信号，可以从根本上去掉这个轮询 kernel。
+
+**压测注意**：L1 的 lazy 扩容每次用 `hipHostRegister` 锁 10 GB，锁的过程中 server 的 IPC event record 和注册时打开 IPC 句柄会被挡住几秒（表现为约 10 s 的 burst 卡顿、注册超时、实例被回收）。压测时让 `SB_L1` 等于 `SB_L1_INIT`，跑的过程中不扩容。
+
 ## 8. 局限与待确认的问题
 
 - **只针对 ROCm**：CUDA 上 `cudaEventDestroy` 不会同步，事件池在那里只省掉导入和新建的调用。我们没有测 CUDA。等 ROCm 7.2 的 backport（#11529）合入，或者带 #7710 的版本发布后，销毁的开销会消失，事件池就变成一个较小的优化（少几次导入）。

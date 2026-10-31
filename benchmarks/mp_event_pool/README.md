@@ -253,6 +253,43 @@ others and are not comparable. Its sweep numbers above are clean.
   writes in flight, though, so its usage ratio peaks higher. Size L1 with headroom
   (we used 800 GB for 638 GB of data; 1200 GB would be safer for the -w4 pool arm).
 
+## 7b. Persistent kernels (e.g. ATOM mono) and the device-side wait
+
+On ROCm 7.2 the server's `stream.wait_event` on an imported IPC event is a
+one-work-item kernel (`streamOpsWait`, rocclr default `GPU_STREAMOPS_CP_WAIT=false`)
+that polls the event's signal until the client's GPU work writes it. ATOM's mono
+decode kernels need all their CTAs co-resident (one per CU) and spin on each
+other. If the polling kernel is resident when such a kernel is dispatched and
+takes the slot one of its CTAs needs, the persistent kernel waits for the CU and
+the polling kernel waits for a signal written after the persistent kernel: both
+hang. Reproduced with `mono_hang_repro.py` on one MI355X (ROCm 7.2.4):
+
+| persistent kernel fills | `--mode stream` (stock wait) | `--mode host` | `--mode gate` |
+|---|---|---|---|
+| every CU (2 × 1024-thread CTAs per CU) | **hangs at iteration 2** (2 of 2 runs) | 100 iterations OK | 100 iterations OK |
+| half of each CU (1 CTA per CU) | 100 iterations OK | – | – |
+
+Two opt-in switches remove the device-side wait on unfinished work:
+
+- `LMCACHE_MP_SUBMIT_AFTER_PRODUCER=1` (client): the ATOM adapter holds each
+  store/retrieve on a host thread until its producer event has fired, then sends
+  it. `submit_*` returns a future that reports not-done until then; the engine's
+  calling thread spends 0.75 ms instead of 4.4 ms per store submit.
+- `LMCACHE_MP_HOST_WAIT_PRODUCER=1` (server): check the producer event with
+  `query()` (host memory only); skip the stream wait when it has fired, otherwise
+  poll on the host instead of enqueueing a device-side wait.
+
+With both on, `srvbench` (pooled events, `--max-gpu-workers 4`, 2 runs each, no
+L1 expansion) is unchanged: single conversation store/retrieve p50 33/84 ms vs
+33/85 ms, bursts 0.90/1.20 s vs 0.85/1.32 s, 0 failed ops. ROCm develop
+([#5575](https://github.com/ROCm/rocm-systems/pull/5575)) replaces emulated IPC
+events with ROCr IPC signals waited on by the CP, which removes the polling kernel.
+
+**Benchmark note.** Lazy L1 growth pins 10 GB chunks with `hipHostRegister`, and
+while a chunk is pinned the server's IPC event records and IPC handle opens stall
+for seconds (seen as ~10 s burst stalls, registration timeouts and reaped
+instances). Set `SB_L1` equal to `SB_L1_INIT` so L1 never grows during a run.
+
 ## 8. Limitations and open questions
 
 - **ROCm-specific.** On CUDA, `cudaEventDestroy` does not synchronize, so there the pool
