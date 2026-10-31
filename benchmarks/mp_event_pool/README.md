@@ -195,6 +195,7 @@ PYTHONPATH=/w/site-dev      bash run_srvbench.sh runs/dev-stock@r1 0
 PYTHONPATH=/w/site-pool-dev bash run_srvbench.sh runs/dev-pool@r1  1
 PYTHONPATH=/w/site-dev      bash run_srvbench.sh runs/dev-stock-w4@r1 0 --max-gpu-workers 4
 python aggregate.py runs dev-stock dev-pool dev-stock-w4
+python sweep_curves.py runs dev-stock dev-pool dev-stock-w4   # per-prompt-length curves (pass1, mean of rounds)
 ```
 
 `run_srvbench.sh` starts the server (`--chunk-size 256 --supported-transfer-mode

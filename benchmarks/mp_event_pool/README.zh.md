@@ -121,6 +121,7 @@ PYTHONPATH=/w/site-dev      bash run_srvbench.sh runs/dev-stock@r1 0
 PYTHONPATH=/w/site-pool-dev bash run_srvbench.sh runs/dev-pool@r1  1
 PYTHONPATH=/w/site-dev      bash run_srvbench.sh runs/dev-stock-w4@r1 0 --max-gpu-workers 4
 python aggregate.py runs dev-stock dev-pool dev-stock-w4
+python sweep_curves.py runs dev-stock dev-pool dev-stock-w4   # 按 prompt 长度出曲线（pass1，各轮均值）
 ```
 
 `run_srvbench.sh` 启动 server（`--chunk-size 256 --supported-transfer-mode lmcache_driven --eviction-ratio 0.01`，L1 由 `SB_L1` 指定，额外参数原样传给 server），跑完两个阶段后写出 `summary.json`。延迟在 client 端测：从 4 个 rank 都提交了这次操作开始，到每个 rank 的完成 event 都报告完成为止。**L1 要留足余量、保证全程不淘汰，并且启动时一次分配好（`SB_LAZY=0`）**：L1 只有 400 GB，或者用 `--l1-use-lazy` 边用边扩时，burst 阶段会淘汰甚至分配失败，延迟主要由内存压力决定，看不出 event 的差别。可以在 `server.log` 里搜 `triggering eviction`，并看 `summary.json` 里 retrieve 的次数（没有淘汰时每次是 144）。
