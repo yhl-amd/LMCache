@@ -186,6 +186,41 @@ _PRODUCER_EVENT_CACHE = 4096
 # the instance; a client still polling the older operation then sees the newer record,
 # which completes later on the same stream (conservative, never early).
 _COMPLETION_EVENT_POOL = int(os.environ.get("LMCACHE_MP_COMPLETION_POOL", "512"))
+# Order copies after the client's producer event on the host instead of with a
+# stream wait.
+_HOST_WAIT_PRODUCER = os.environ.get("LMCACHE_MP_HOST_WAIT_PRODUCER", "") == "1"
+_HOST_WAIT_POLL_S = 50e-6
+_host_waits = 0
+
+
+def _order_after_producer(
+    event_backend: EventIPCBackend, producer_event: object, stream: object
+) -> None:
+    """Make work queued next on ``stream`` start after the client's producer event.
+
+    By default this is a stream wait. On ROCm 7.2 a stream wait on an imported
+    IPC event is a one-work-item kernel that polls the event's signal until the
+    client's GPU work fires it. If the client's stream is running a kernel that
+    needs every CU co-resident (a persistent kernel with one CTA per CU), that
+    polling kernel can hold the slot one of its CTAs needs, and neither kernel
+    finishes. With LMCACHE_MP_HOST_WAIT_PRODUCER=1 the server checks the event on
+    the host (``query`` reads host memory only) and queues the copy once it has
+    fired, so no device-side wait is enqueued. The signal is written after a
+    release barrier, so the client's writes are visible by then.
+    """
+    global _host_waits
+    if not _HOST_WAIT_PRODUCER:
+        event_backend.wait_event(producer_event, stream)
+        return
+    if event_backend.query_event(producer_event):
+        return
+    # The client sent the request before its producer event fired: wait here.
+    # A client with LMCACHE_MP_SUBMIT_AFTER_PRODUCER=1 never takes this path.
+    _host_waits += 1
+    if _host_waits in (1, 10, 100, 1000) or _host_waits % 10000 == 0:
+        logger.info("Host-waited on %d producer events not yet complete", _host_waits)
+    while not event_backend.query_event(producer_event):
+        time.sleep(_HOST_WAIT_POLL_S)
 
 
 def _producer_event(entry: ContextEntry, handle: bytes, device: object) -> object:
@@ -784,7 +819,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 producer_event = event_backend.import_event(
                     event_ipc_handle, cache_context.device
                 )
-            event_backend.wait_event(producer_event, cache_context.stream)
+            _order_after_producer(event_backend, producer_event, cache_context.stream)
             import_token = cache_context.hold_imported_event(producer_event)
             submit_callback_to_stream(
                 cache_context.cupy_stream,
@@ -1105,7 +1140,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 producer_event = event_backend.import_event(
                     event_ipc_handle, cache_context.device
                 )
-            event_backend.wait_event(producer_event, cache_context.stream)
+            _order_after_producer(event_backend, producer_event, cache_context.stream)
             import_token = cache_context.hold_imported_event(producer_event)
             submit_callback_to_stream(
                 cache_context.cupy_stream,

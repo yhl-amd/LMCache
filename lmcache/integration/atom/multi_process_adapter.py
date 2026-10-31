@@ -8,11 +8,13 @@ transport and device-event futures stay under :mod:`lmcache.v1.multiprocess`.
 """
 
 # Standard
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -25,6 +27,7 @@ from lmcache.v1.multiprocess.custom_types import (
     IPC_EVENT_MAX_RECORDS,
     IPCCacheServerKey,
 )
+from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
@@ -45,6 +48,9 @@ DEFAULT_HEARTBEAT_INTERVAL = 10.0
 
 # Reuse producer IPC events and accept pooled completion events.
 _POOLED_EVENTS = os.environ.get("LMCACHE_MP_POOLED_EVENTS", "") == "1"
+# Send a store/retrieve only after its producer event has completed.
+_SUBMIT_AFTER_PRODUCER = os.environ.get("LMCACHE_MP_SUBMIT_AFTER_PRODUCER", "") == "1"
+_PRODUCER_POLL_S = 50e-6
 
 
 class _ProducerEventPool:
@@ -78,6 +84,111 @@ class _ProducerEventPool:
             event.record(torch.cuda.current_stream())
             self._records[slot] += 1
             return event
+
+
+class _GatedFuture:
+    """Future of a store/retrieve that is held back until its producer event fires.
+
+    Exposes the part of ``MessagingFuture`` ATOM uses (``query``, ``result``) and
+    ``retain_reference``. Before the request is sent, ``query`` is False.
+    """
+
+    def __init__(self) -> None:
+        self._sent = threading.Event()
+        self._inner: MessagingFuture[bool] | None = None
+        self._error: BaseException | None = None
+        self._refs: list[object] = []
+
+    def _set(self, inner: MessagingFuture[bool] | None) -> None:
+        self._inner = inner
+        self._sent.set()
+
+    def _fail(self, error: BaseException) -> None:
+        self._error = error
+        self._sent.set()
+
+    def retain_reference(self, value: object) -> None:
+        self._refs.append(value)
+
+    def query(self) -> bool:
+        if not self._sent.is_set():
+            return False
+        if self._error is not None or self._inner is None:
+            return True
+        return self._inner.query()
+
+    def result(self, timeout: float | None = None) -> bool:
+        start = time.monotonic()
+        if not self._sent.wait(timeout):
+            raise LMCacheTimeoutError("Future result not available within timeout")
+        if self._error is not None:
+            raise self._error
+        if self._inner is None:
+            return False
+        if timeout is None:
+            return self._inner.result()
+        return self._inner.result(
+            timeout=max(0.0, timeout - (time.monotonic() - start))
+        )
+
+
+class _ProducerGate:
+    """Sends store/retrieve requests once their producer event has completed.
+
+    On ROCm 7.2 the server's stream wait on an imported IPC event is a
+    one-work-item kernel polling the event's signal. If the producer's stream is
+    still running a kernel that needs every CU co-resident (a persistent kernel
+    with one CTA per CU), that polling kernel can hold the slot one of its CTAs
+    needs, and neither finishes. Holding a request on the host until its producer
+    event has fired means the server's wait never depends on unfinished engine
+    work. ``event.query()`` on an interprocess event only reads host memory.
+
+    Requests are sent in submission order from one thread, so a rank's
+    operations reach the server in the order the engine issued them.
+    """
+
+    def __init__(self) -> None:
+        self._queue: deque[tuple[Any, Callable[[], Any], _GatedFuture]] = deque()
+        self._cond = threading.Condition()
+        self._stopping = False
+        self._thread = threading.Thread(
+            target=self._run, name="lmcache-atom-producer-gate", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, event: Any, send: Callable[[], Any], future: _GatedFuture) -> None:
+        with self._cond:
+            self._queue.append((event, send, future))
+            self._cond.notify()
+
+    def close(self) -> None:
+        """Stop after the queued requests have been sent."""
+        with self._cond:
+            self._stopping = True
+            self._cond.notify()
+        self._thread.join()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._queue and not self._stopping:
+                    self._cond.wait()
+                if not self._queue:
+                    return
+                event, send, future = self._queue[0]
+            try:
+                while not event.query():
+                    time.sleep(_PRODUCER_POLL_S)
+            except BaseException:
+                # A failed query should not wedge the queue; the server still
+                # orders the copy after the event.
+                logger.warning("Producer event query failed", exc_info=True)
+            with self._cond:
+                self._queue.popleft()
+            try:
+                future._set(send())
+            except BaseException as e:  # noqa: BLE001 - reported via result()
+                future._fail(e)
 
 
 class _IpcEvent(Protocol):
@@ -386,6 +497,7 @@ class AtomMPWorkerAdapter:
         self._client = client
         self.blocks_in_chunk = self.lmcache_tokens_per_chunk // block_size
         self._producer_events = _ProducerEventPool() if _POOLED_EVENTS else None
+        self._producer_gate = _ProducerGate() if _SUBMIT_AFTER_PRODUCER else None
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._engine_group_infos: list[EngineGroupInfo] = []
         self._transfer_context: TransferContext | None = None
@@ -486,21 +598,37 @@ class AtomMPWorkerAdapter:
                 if self._producer_events is None
                 else self._producer_events.record()
             )
-            future = context.submit_store(
-                request_id,
-                self._create_key(request_id, spec),
-                kv_caches,
-                block_ids,
-                wire_event,
-                self.blocks_in_chunk,
-            )
-            future.retain_reference(event)
-            if wire_event is not event:
-                future.retain_reference(wire_event)
-            self._track_operation_future(context, future)
-        finally:
+            key = self._create_key(request_id, spec)
+        except BaseException:
             self._release_submission_lease(context)
-        return future
+            raise
+
+        def send() -> MessagingFuture[bool]:
+            try:
+                future = context.submit_store(
+                    request_id,
+                    key,
+                    kv_caches,
+                    block_ids,
+                    wire_event,
+                    self.blocks_in_chunk,
+                )
+                future.retain_reference(event)
+                if wire_event is not event:
+                    future.retain_reference(wire_event)
+                self._track_operation_future(context, future)
+                return future
+            finally:
+                # Held until the request is sent, so shutdown waits for it.
+                self._release_submission_lease(context)
+
+        if self._producer_gate is None:
+            return send()
+        gated = _GatedFuture()
+        gated.retain_reference(event)
+        gated.retain_reference(wire_event)
+        self._producer_gate.submit(wire_event, send, gated)
+        return gated  # type: ignore[return-value]
 
     def submit_retrieve_request(
         self,
@@ -532,21 +660,37 @@ class AtomMPWorkerAdapter:
                 if self._producer_events is None
                 else self._producer_events.record()
             )
-            future = context.submit_retrieve(
-                request_id,
-                self._create_key(request_id, spec),
-                kv_caches,
-                block_ids,
-                wire_event,
-                self.blocks_in_chunk,
-            )
-            future.retain_reference(event)
-            if wire_event is not event:
-                future.retain_reference(wire_event)
-            self._track_operation_future(context, future)
-        finally:
+            key = self._create_key(request_id, spec)
+        except BaseException:
             self._release_submission_lease(context)
-        return future
+            raise
+
+        def send() -> MessagingFuture[bool]:
+            try:
+                future = context.submit_retrieve(
+                    request_id,
+                    key,
+                    kv_caches,
+                    block_ids,
+                    wire_event,
+                    self.blocks_in_chunk,
+                )
+                future.retain_reference(event)
+                if wire_event is not event:
+                    future.retain_reference(wire_event)
+                self._track_operation_future(context, future)
+                return future
+            finally:
+                # Held until the request is sent, so shutdown waits for it.
+                self._release_submission_lease(context)
+
+        if self._producer_gate is None:
+            return send()
+        gated = _GatedFuture()
+        gated.retain_reference(event)
+        gated.retain_reference(wire_event)
+        self._producer_gate.submit(wire_event, send, gated)
+        return gated  # type: ignore[return-value]
 
     def shutdown(self) -> None:
         """Stop heartbeat, unregister ATOM cache views, and close the client."""
@@ -580,6 +724,8 @@ class AtomMPWorkerAdapter:
             with self._state_changed:
                 while self._registrations_inflight or self._context_submission_leases:
                     self._state_changed.wait()
+            if self._producer_gate is not None:
+                self._producer_gate.close()
 
             self._drain_operation_futures()
 
