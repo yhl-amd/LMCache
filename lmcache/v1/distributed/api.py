@@ -10,7 +10,6 @@ Could be implemented by native code in the future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, get_args
 import enum
-import os
 
 # Third Party
 import torch
@@ -594,44 +593,6 @@ class PrefetchResult:
         return self._l2_hit_count
 
 
-# Build ObjectKeys in bulk without the per-key frozen-dataclass __init__ and
-# __post_init__: the validated fields (model_name, object_group_id, cache_salt) are
-# shared by every key of a call, so they are validated once.
-_FAST_OBJECT_KEYS = os.environ.get("LMCACHE_MP_FAST_KEYS", "") == "1"
-
-
-def _object_keys_unchecked(
-    chunk_hashes: list[bytes],
-    model_name: str,
-    kv_ranks: list[int],
-    object_group_id: int,
-    cache_salt: str,
-) -> list[ObjectKey]:
-    """ObjectKeys for every (chunk, kv rank), chunk-major, validated once."""
-    ObjectKey(
-        chunk_hash=b"",
-        model_name=model_name,
-        kv_rank=0,
-        object_group_id=object_group_id,
-        cache_salt=cache_salt,
-    )
-    new = object.__new__
-    out: list[ObjectKey] = []
-    append = out.append
-    for chunk_hash in chunk_hashes:
-        for kv_rank in kv_ranks:
-            key = new(ObjectKey)
-            key.__dict__.update(
-                chunk_hash=chunk_hash,
-                model_name=model_name,
-                kv_rank=kv_rank,
-                object_group_id=object_group_id,
-                cache_salt=cache_salt,
-            )
-            append(key)
-    return out
-
-
 def ipc_key_to_object_keys(
     ipc_key: "IPCCacheServerKey",
     chunk_hashes: list[bytes],
@@ -665,14 +626,6 @@ def ipc_key_to_object_keys(
     # The (chunk_hash, kv_rank) expansion is independent of the object group,
     # so compute it once and reuse it for every group.
     kv_ranks = _lookup_kv_ranks(ipc_key)
-
-    if _FAST_OBJECT_KEYS:
-        return [
-            _object_keys_unchecked(
-                chunk_hashes, ipc_key.model_name, kv_ranks, gid, cache_salt
-            )
-            for gid in object_group_ids
-        ]
 
     return [
         [
@@ -744,15 +697,7 @@ def ipc_key_to_grouped_object_keys(
         for kv_rank in kv_ranks:
             rows.append(
                 GroupedObjectKeys(
-                    keys=_object_keys_unchecked(
-                        chunk_hashes,
-                        ipc_key.model_name,
-                        [kv_rank],
-                        object_group_id,
-                        ipc_key.cache_salt,
-                    )
-                    if _FAST_OBJECT_KEYS
-                    else [
+                    keys=[
                         ObjectKey(
                             chunk_hash=chunk_hash,
                             model_name=ipc_key.model_name,
