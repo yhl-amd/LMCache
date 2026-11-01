@@ -16,9 +16,10 @@ depend on any one of them. See
 from __future__ import annotations
 
 # Standard
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Protocol, runtime_checkable
 import inspect
+import threading
 
 # First Party
 from lmcache import torch_dev, torch_device_type
@@ -165,6 +166,15 @@ class EventIPCBackend(Protocol):
 # won't access the dangling references to the events.
 _EXPORTED_EVENT_RING_SIZE = 2048
 
+# Completion events from a server's per-instance pool (handle prefixed with
+# custom_types.POOLED_EVENT_MAGIC) are re-recorded by the server and never destroyed
+# while registered, so they are imported once and kept: an imported event's destroy
+# blocks until this process's GPU work drains. Bounded for server restarts.
+_POOLED_EVENT_MAGIC = b"LMCPOOL1"
+_POOLED_IMPORT_CACHE_SIZE = 16384
+_pooled_imports: "OrderedDict[tuple[str, bytes], object]" = OrderedDict()
+_pooled_imports_lock = threading.Lock()
+
 
 class DefaultEventIPCBackend(EventIPCBackend):
     """CUDA-style event IPC backend over an injectable event module.
@@ -239,6 +249,19 @@ class DefaultEventIPCBackend(EventIPCBackend):
 
     def import_event(self, handle: bytes, device: object) -> object:
         """Reconstruct an event from an IPC handle on ``device``."""
+        if handle[: len(_POOLED_EVENT_MAGIC)] == _POOLED_EVENT_MAGIC:
+            raw = handle[len(_POOLED_EVENT_MAGIC) :]
+            cache_key = (str(device), raw)
+            with _pooled_imports_lock:
+                event = _pooled_imports.get(cache_key)
+                if event is None:
+                    event = self._event_module.Event.from_ipc_handle(  # type: ignore[union-attr]
+                        device, raw
+                    )
+                    _pooled_imports[cache_key] = event
+                    if len(_pooled_imports) > _POOLED_IMPORT_CACHE_SIZE:
+                        _pooled_imports.popitem(last=False)
+            return event
         return self._event_module.Event.from_ipc_handle(  # type: ignore[union-attr]
             device, handle
         )

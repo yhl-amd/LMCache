@@ -13,7 +13,7 @@ import time
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import CHUNK_HASH_BYTES, IPCCacheServerKey
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.periodic_thread import (
     PeriodicThread,
@@ -24,6 +24,23 @@ from lmcache.v1.periodic_thread import (
 )
 
 logger = init_logger(__name__)
+
+
+def _same_content(
+    key: IPCCacheServerKey, lookup_key: IPCCacheServerKey, chunk_size: int
+) -> bool:
+    """Whether ``key`` addresses the same tokens as the lookup that locked them.
+
+    Token-mode keys compare token ids. Hash-mode keys carry hashes for their own
+    ``[start, end)`` only, so they are compared with the matching slice of the
+    lookup's hashes (which start at token 0).
+    """
+    if not key.chunk_hashes and not lookup_key.chunk_hashes:
+        return key.token_ids == lookup_key.token_ids
+    if not key.chunk_hashes or not lookup_key.chunk_hashes:
+        return False
+    lo = (key.start // chunk_size) * CHUNK_HASH_BYTES
+    return lookup_key.chunk_hashes[lo : lo + len(key.chunk_hashes)] == key.chunk_hashes
 
 
 @dataclass
@@ -60,6 +77,39 @@ class Session:
         """
         with self._lock:
             self.token_ids = full_token_ids
+
+    def record_chunk_hashes(self, start: int, hashes: list[bytes]) -> None:
+        """Extend the cached rolling hashes with client-computed ones.
+
+        Used when the client sends chunk hashes instead of token ids
+        (``IPCCacheServerKey.chunk_hashes``). Hashes for chunks already cached
+        are not replaced; a gap before ``start`` leaves the cache unchanged.
+
+        Args:
+            start: Token index of ``hashes[0]`` (chunk-aligned).
+            hashes: Rolling chunk hashes for consecutive chunks from ``start``.
+        """
+        start_chunk = start // self.hasher.chunk_size
+        with self._lock:
+            have = self.num_chunks_processed
+            if start_chunk > have or start_chunk + len(hashes) <= have:
+                return
+            new = hashes[have - start_chunk :]
+            del self.chunk_hashes[have:]
+            self.chunk_hashes.extend(new)
+            self.num_chunks_processed = have + len(new)
+            self.last_prefix_hash = self.chunk_hashes[-1]
+
+    def known_chunk_hashes(self) -> list:
+        """Hashes of every complete chunk this session knows about.
+
+        Token-mode sessions hash their tokens through the last full chunk;
+        hash-mode sessions (no tokens) return what clients reported.
+        """
+        if self.token_ids:
+            return self.get_hashes(0)
+        with self._lock:
+            return list(self.chunk_hashes[: self.num_chunks_processed])
 
     @overload
     def get_hashes(self, start: int, end: int) -> list: ...
@@ -182,7 +232,7 @@ class Session:
             same_lookup = (
                 key.model_name == lookup_key.model_name
                 and key.world_size == lookup_key.world_size
-                and key.token_ids == lookup_key.token_ids
+                and _same_content(key, lookup_key, self.hasher.chunk_size)
                 and key.cache_salt == lookup_key.cache_salt
                 and key.start >= lookup_key.start
                 and key.end <= lookup_key.end
@@ -227,7 +277,7 @@ class Session:
             same_lookup = (
                 key.model_name == lookup_key.model_name
                 and key.world_size == lookup_key.world_size
-                and key.token_ids == lookup_key.token_ids
+                and _same_content(key, lookup_key, self.hasher.chunk_size)
                 and key.cache_salt == lookup_key.cache_salt
                 and key.start >= lookup_key.start
                 and key.end <= lookup_key.end
